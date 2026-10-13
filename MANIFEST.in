@@ -1,2 +1,3 @@
 include examples/*.dbml
+include examples/*.py
 include tests/*.cjs

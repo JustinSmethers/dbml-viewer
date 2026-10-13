@@ -7,6 +7,7 @@ from pathlib import Path
 
 from dbml_viewer.parser import parse_dbml
 from dbml_viewer.renderer import render_html
+from dbml_viewer.compare import compare_branch
 
 
 def main():
@@ -23,6 +24,10 @@ def main():
         help="Layout direction: LR (left-to-right) or TB (top-to-bottom). Default: LR",
     )
     ap.add_argument(
+        "--compare", metavar="REF", default=None,
+        help="Highlight DBML changes since the merge base of HEAD and REF (includes local edits)",
+    )
+    ap.add_argument(
         "--no-open", action="store_true",
         help="Don't automatically open the diagram in the browser",
     )
@@ -36,6 +41,11 @@ def main():
 
     print(f"Parsing {args.input}...", file=sys.stderr)
     data = parse_dbml(args.input)
+    if args.compare:
+        try:
+            data["comparison"] = compare_branch(args.input, data, args.compare)
+        except ValueError as exc:
+            ap.error(str(exc))
     print(
         f"  {len(data['tables'])} tables, {len(data['refs'])} refs, "
         f"{len(data['groups'])} groups, {len(data['enums'])} enums",

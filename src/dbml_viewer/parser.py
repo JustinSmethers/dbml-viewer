@@ -37,14 +37,26 @@ def parse_dbml(path: Path) -> dict:
             "enums": [{ "name", "values": [...] }]
         }
     """
-    db = PyDBML.parse_file(str(path))
+    return _normalize(PyDBML.parse_file(str(path)))
+
+
+def parse_dbml_text(text: str) -> dict:
+    """Parse a Git snapshot without writing it into the working tree."""
+    return _normalize(PyDBML(text))
+
+
+def _table_name(table) -> str:
+    return table.name if table.schema == "public" else f"{table.schema}.{table.name}"
+
+
+def _normalize(db) -> dict:
 
     # Build table-to-group mapping
     table_group_map = {}
     groups = {}
     group_colors = {}
     for group in db.table_groups:
-        group_tables = [item.name for item in group.items]
+        group_tables = [_table_name(item) for item in group.items]
         groups[group.name] = group_tables
         if group.color:
             group_colors[group.name] = group.color
@@ -57,9 +69,9 @@ def parse_dbml(path: Path) -> dict:
     for ref in db.refs:
         from_cols, to_cols, marks_fk = _normalize_ref_pairs(ref)
         for from_col_obj, to_col_obj in zip(from_cols, to_cols):
-            from_table = from_col_obj.table.name
+            from_table = _table_name(from_col_obj.table)
             from_col = from_col_obj.name
-            to_table = to_col_obj.table.name
+            to_table = _table_name(to_col_obj.table)
             to_col = to_col_obj.name
             refs.append({
                 "from_table": from_table,
@@ -80,14 +92,19 @@ def parse_dbml(path: Path) -> dict:
                 "name": col.name,
                 "type": str(col.type),
                 "pk": col.pk,
-                "fk": (table.name, col.name) in fk_columns,
+                "fk": (_table_name(table), col.name) in fk_columns,
                 "not_null": col.not_null,
+                "unique": col.unique,
+                "autoinc": col.autoinc,
+                "default": str(col.default) if col.default is not None else None,
+                "default_kind": type(col.default).__name__ if col.default is not None else None,
                 "note": str(col.note) if col.note else "",
             })
         tables.append({
-            "name": table.name,
+            "name": _table_name(table),
             "note": str(table.note) if table.note else "",
-            "group": table_group_map.get(table.name, "_default"),
+            "group": table_group_map.get(_table_name(table), "_default"),
+            "indexes": sorted(index.dbml for index in table.indexes),
             "columns": columns,
         })
 
