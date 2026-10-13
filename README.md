@@ -41,8 +41,17 @@ dbml-viewer examples/layered.dbml
 # Generate without opening browser
 dbml-viewer model.dbml --no-open
 
-# Highlight this branch's DBML changes, including local edits
+# Branch model source changes are highlighted by default against main
+dbml-viewer model.dbml
+
+# Use a different comparison branch
 dbml-viewer model.dbml --compare main
+
+# Skip branch comparison
+dbml-viewer model.dbml --no-compare
+
+# Explicitly compare the DBML schema instead of model source files
+dbml-viewer model.dbml --compare-dbml main
 ```
 
 ### Options
@@ -53,17 +62,26 @@ dbml-viewer model.dbml --compare main
 | `-o`, `--output` | Output HTML file path | `<input>_diagram.html` |
 | `--layout` | Layout direction: `TB` (top-to-bottom) or `LR` (left-to-right) | `LR` |
 | `--no-open` | Skip auto-opening the browser | Off |
-| `--compare REF` | Compare the input with its Git snapshot at the merge base of `HEAD` and `REF` | Off |
+| `--compare REF` | Compare model source files against the merge base of `HEAD` and `REF`, including local edits | Freshly fetched `origin/main`; local `main` without an origin remote |
+| `--no-compare` | Disable branch change highlighting | Off |
+| `--compare-dbml REF` | Compare the DBML schema itself with its Git snapshot at the merge base | Off |
+| `--project-dir PATH` | Select the model Git checkout when the generated DBML is elsewhere | Input file's repository, then current directory |
 
 ### Reviewing branch changes
 
-Use `--compare main` (or `--compare origin/main`) inside a Git checkout. The viewer compares the current on-disk DBML, including uncommitted edits, with the same path at the branches' common ancestor. The chosen ref must exist locally; fetch it yourself if needed. A file absent at the baseline is treated as new. Renamed models or DBML files appear as removals/additions or an all-new file; renames are not inferred.
+Branch highlighting is automatic. The viewer fetches `origin/main` and compares SQL and Python model source files with its common ancestor with `HEAD`. This avoids stale local `main` branches. It includes committed branch changes, staged and unstaged edits, and non-ignored untracked model files. Logic-only changes highlight a model even when its columns and relationships are unchanged. The generated DBML does not need to be committed or present on `main`.
+
+For dbt projects, the viewer reads `model-paths` from `dbt_project.yml`; otherwise it looks under directories named `models`. It uses a local `target/manifest.json` (or the project's configured `target-path`) to match aliases and schema-qualified names, falling back to unique model filename matches. Changed sources with missing or ambiguous cards are still listed in **Review** with their paths. Macros, tests, model YAML, seeds, and snapshots do not mark models as edited, and indirect downstream impact is not inferred. Regenerate the DBML/manifest when new models or aliases need to appear in the diagram.
+
+Use `--compare REF` to choose another baseline, `--no-compare` to disable the overlay, or `--project-dir /path/to/project` when the generated DBML is outside your model repository and you are running elsewhere. Both `--compare main` and `--compare origin/main` refresh and use `origin/main` when an origin remote is configured. Other comparison refs must exist locally. Fetching updates the remote tracking ref without switching branches or moving local `main`. If the fetch fails, the viewer reports that comparison is unavailable and generates the diagram without highlighting; explicitly requested comparisons exit with an error. It never silently falls back to a stale local main after a failed fetch. Repositories without an origin remote can use local `main` (or an existing `origin/main`). Renaming a model source appears as removal/addition; moving a file while preserving a uniquely matched model name appears as a modification.
 
 The **Highlight changes** toggle adds green outlines and `+ NEW` badges to new models, and amber outlines and `~ EDITED` badges to modified models. Layer colors stay visible. Unchanged models fade slightly. **Focus changes** zooms to changed models and their immediate relationship neighbors, fading unrelated cards and joins. Toggling highlighting preserves table positions.
 
 Click a card's badge or **Review** to inspect its changes and emphasize that model and its immediate neighbors. **Previous** and **Next** cycle through changed models, including removals. Removed models appear in the review panel and counts; they do not occupy ghost cards in the diagram. Escape closes the panel and clears a pinned join.
 
-Comparison ignores comments, whitespace, declaration order and equivalent `<`/`>` ref spelling. It detects added/removed columns, types, key/null/unique/increment/default constraints, notes, indexes, groups, group colors, enums used by columns, and declared relationships. A relationship change marks both endpoint models as modified. This reflects the schema represented in DBML; SQL-only changes and undeclared relationships are not detected. Changes are captured when HTML is generated; regenerate to refresh them.
+Source comparison detects file changes, including comments and formatting. Changes are captured when HTML is generated; regenerate to refresh them.
+
+For semantic schema review, use `--compare-dbml REF`. This opt-in mode compares the current on-disk DBML with the same path at the merge base. It ignores comments, whitespace, declaration order and equivalent `<`/`>` ref spelling. It detects added/removed columns, types, key/null/unique/increment/default constraints, notes, indexes, groups, group colors, enums used by columns, and declared relationships. A relationship change marks both endpoint models as modified. A DBML file absent at the baseline is treated as all-new; renames are not inferred.
 
 For a demo with one new, one modified and one removed model:
 
@@ -166,6 +184,8 @@ src/
 └── dbml_viewer/
     ├── __main__.py        # Package CLI entry point
     ├── main.py            # Console-script entry point
+    ├── source_compare.py  # Model source changes against the branch merge base
+    ├── compare.py         # Opt-in semantic DBML comparison
     ├── parser.py          # DBML parsing via pydbml -> normalized dict
     ├── renderer.py        # Jinja2 template rendering + color scheme
     └── templates/

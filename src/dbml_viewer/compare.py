@@ -6,13 +6,35 @@ from pathlib import Path
 from dbml_viewer.parser import parse_dbml_text
 
 
-def _git(cwd: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(cwd), *args], capture_output=True, text=True,
-    )
+def _git(cwd: Path, *args: str, strip: bool = True) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("Git command timed out after 30 seconds") from exc
     if result.returncode:
         raise ValueError(result.stderr.strip() or "Git comparison failed")
-    return result.stdout.strip()
+    return result.stdout.strip() if strip else result.stdout
+
+
+def comparison_revision(root: Path, revision: str | None = None) -> str:
+    """Use a freshly fetched origin/main instead of a potentially stale local main."""
+    if revision in (None, "main", "origin/main") and "origin" in _git(root, "remote").splitlines():
+        try:
+            _git(root, "fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
+        except ValueError as exc:
+            raise ValueError(f"Could not refresh origin/main; refusing to use a stale main baseline: {exc}") from exc
+        return "origin/main"
+    if revision is not None:
+        return revision
+    for candidate in ("main", "origin/main"):
+        try:
+            _git(root, "rev-parse", "--verify", "--end-of-options", candidate + "^{commit}")
+            return candidate
+        except ValueError:
+            pass
+    raise ValueError("Neither main nor origin/main exists locally; use --compare REF or configure origin")
 
 
 def compare_branch(path: Path, current: dict, revision: str) -> dict:
@@ -20,6 +42,7 @@ def compare_branch(path: Path, current: dict, revision: str) -> dict:
     path = path.resolve()
     try:
         root = Path(_git(path.parent, "rev-parse", "--show-toplevel"))
+        revision = comparison_revision(root, revision)
         target = _git(root, "rev-parse", "--verify", "--end-of-options", revision + "^{commit}")
         base = _git(root, "merge-base", "HEAD", target)
         relative = path.relative_to(root).as_posix()
