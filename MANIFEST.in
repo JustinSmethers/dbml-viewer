@@ -1,0 +1,2 @@
+include examples/*.dbml
+include tests/*.cjs

@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ data.project.name or "DBML Diagram" }}</title>
+<style>
+  /* ── Reset & Base ─────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    background: #101827;
+    color: #333;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  /* ── Diagram viewport ────────────────────────────────────────── */
+  .diagram-container {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    position: relative;
+    background:
+      radial-gradient(circle at 1px 1px, rgba(148,163,184,0.12) 1px, transparent 0);
+    background-size: 24px 24px;
+    cursor: grab;
+  }
+  .diagram-container.grabbing { cursor: grabbing; }
+  .diagram-canvas {
+    position: absolute;
+    transform-origin: 0 0;
+    will-change: transform;
+  }
+
+  /* ── Table nodes ─────────────────────────────────────────────── */
+  .table-node {
+    position: absolute;
+    min-width: 240px;
+    border-radius: 8px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.2);
+    border: 1px solid #cbd5e1;
+    background: #fff;
+    cursor: move;
+    user-select: none;
+    transition: box-shadow 0.15s;
+    z-index: 5;
+  }
+  .table-node:hover {
+    box-shadow: 0 8px 28px rgba(0,0,0,0.35), 0 2px 8px rgba(0,0,0,0.2);
+    z-index: 10;
+  }
+  .table-header {
+    padding: 10px 14px;
+    border-radius: 8px 8px 0 0;
+    color: #fff;
+    font-weight: 600;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    letter-spacing: 0.3px;
+  }
+  .table-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .toggle-icon {
+    font-size: 16px;
+    margin-left: 8px;
+    opacity: 0.7;
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+  .table-node.collapsed .toggle-icon { transform: rotate(-90deg); }
+
+  /* ── Column rows ─────────────────────────────────────────────── */
+  .table-columns {
+    border-top: 1px solid #e8e8e8;
+    border-radius: 0 0 8px 8px;
+  }
+  .table-node.collapsed .table-columns {
+    display: none;
+  }
+  .table-node.keys-only .column-row:not(.join-column) { display: none; }
+  .column-row {
+    display: flex;
+    align-items: center;
+    padding: 5px 14px;
+    font-size: 11.5px;
+    border-bottom: 1px solid #f3f3f3;
+    gap: 6px;
+  }
+  .column-row:last-child { border-bottom: none; }
+  .column-row:hover { background: #f8f9fa; }
+  .col-name {
+    font-weight: 500;
+    color: #2c3e50;
+    flex-shrink: 0;
+  }
+  .col-type {
+    color: #95a5a6;
+    font-size: 10.5px;
+    flex: 1;
+    text-align: right;
+    margin-right: 4px;
+  }
+  .badge {
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 3px;
+    letter-spacing: 0.3px;
+    flex-shrink: 0;
+  }
+  .badge-pk { background: #f39c12; color: #fff; }
+  .badge-fk { background: #3498db; color: #fff; }
+  .badge-nn { background: #ecf0f1; color: #7f8c8d; }
+
+  /* ── Group backgrounds ───────────────────────────────────────── */
+  .group-bg {
+    position: absolute;
+    border-radius: 10px;
+    border: 1px solid;
+    z-index: auto;
+    pointer-events: none;
+  }
+  .group-header {
+    position: relative;
+    z-index: 4;
+    pointer-events: auto;
+    cursor: grab;
+    padding: 6px 14px;
+    border-radius: 8px 8px 0 0;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    user-select: none;
+  }
+  .group-header:active { cursor: grabbing; }
+  .group-count {
+    font-weight: 400;
+    opacity: 0.7;
+    font-size: 10px;
+    text-transform: none;
+  }
+
+  /* ── SVG edge layer ──────────────────────────────────────────── */
+  .edges-svg {
+    position: absolute;
+    top: 0; left: 0;
+    z-index: 3;
+    pointer-events: none;
+    overflow: visible;
+  }
+  .edge-path {
+    fill: none;
+    stroke-width: 1.5;
+    opacity: 0.9;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+    transition: opacity 0.15s, stroke-width 0.15s;
+    pointer-events: stroke;
+  }
+  .edge-path:hover {
+    opacity: 1;
+    stroke-width: 3;
+  }
+  .edge-path.highlighted {
+    opacity: 1;
+    stroke-width: 2.5;
+  }
+
+  /* ── Controls panel ──────────────────────────────────────────── */
+  .controls {
+    position: fixed;
+    top: 16px; right: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    z-index: 100;
+  }
+  .ctrl-btn {
+    width: 36px; height: 36px;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px;
+    background: rgba(23,35,53,0.94);
+    color: #fff;
+    font-size: 16px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(8px);
+    transition: background 0.15s;
+  }
+  .ctrl-btn:hover { background: rgba(60,60,90,0.95); }
+  .ctrl-btn.active { background: rgba(69,183,209,0.7); }
+  .ctrl-btn.wide { width: 84px; font-size: 11px; height: 32px; }
+  .controls { align-items: flex-end; }
+  .table-node.dimmed { opacity: 0.3; }
+  .edge.dimmed { opacity: 0.08; }
+  .edge-halo { fill: none; stroke: #101827; stroke-width: 5; pointer-events: none; }
+  .edge-hit { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; }
+  .edge-port { pointer-events: none; }
+  .join-detail {
+    position: fixed; top: 100px; right: 68px; z-index: 110;
+    max-width: 400px; padding: 14px 38px 14px 16px; border-radius: 10px;
+    background: #172335; border: 1px solid #475569; color: #e2e8f0;
+    font-size: 11px; line-height: 1.7; overflow-wrap: anywhere;
+  }
+  .join-detail[hidden] { display: none; }
+  .join-detail strong { display: block; color: #94a3b8; font-size: 10px; letter-spacing: 0.7px; text-transform: uppercase; }
+  .join-detail button { position: absolute; right: 10px; top: 10px; background: none; color: #cbd5e1; border: 0; cursor: pointer; font-size: 18px; }
+  .empty-message { color: #94a3b8; padding: 120px 32px; text-align: center; }
+
+
+  /* ── Legend panel ────────────────────────────────────────────── */
+  .legend {
+    position: fixed;
+    bottom: 16px; left: 16px;
+    background: rgba(23,35,53,0.94);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px;
+    padding: 12px 16px;
+    z-index: 100;
+    color: #ccc;
+    font-size: 11px;
+  }
+  .legend-title {
+    font-weight: 700;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+    color: #888;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  .legend-dot {
+    width: 12px; height: 12px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+
+  /* ── Tooltip ─────────────────────────────────────────────────── */
+  .tooltip {
+    position: fixed;
+    background: rgba(20,20,40,0.95);
+    color: #e0e0e0;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 11px;
+    max-width: 360px;
+    pointer-events: none;
+    z-index: 200;
+    display: none;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* ── Project header ──────────────────────────────────────────── */
+  .project-header {
+    position: fixed;
+    top: 16px; left: 16px;
+    background: rgba(23,35,53,0.94);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px;
+    padding: 12px 16px;
+    z-index: 100;
+    color: #fff;
+    max-width: 360px;
+  }
+  .project-name {
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 2px;
+  }
+  .project-meta {
+    font-size: 10px;
+    color: #888;
+  }
+
+  /* ── Zoom indicator ──────────────────────────────────────────── */
+  .zoom-indicator {
+    position: fixed;
+    bottom: 16px; right: 16px;
+    background: rgba(23,35,53,0.94);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 6px;
+    padding: 4px 10px;
+    z-index: 100;
+    color: #888;
+    font-size: 11px;
+    font-family: monospace;
+  }
+</style>
+</head>
+<body>
+
+<!-- Project header -->
+<div class="project-header">
+  <div class="project-name">{{ data.project.name or "DBML Diagram" }}</div>
+  <div class="project-meta">{{ data.tables | length }} tables &middot; {{ data.refs | length }} relationships &middot; {{ "Left to right" if layout == "LR" else "Top to bottom" }}</div>
+</div>
+
+<!-- Controls -->
+<div class="controls">
+  <button class="ctrl-btn" id="zoom-in" title="Zoom in">+</button>
+  <button class="ctrl-btn" id="zoom-out" title="Zoom out">&minus;</button>
+  <button class="ctrl-btn" id="zoom-fit" title="Fit to screen">&#x2922;</button>
+  <button class="ctrl-btn" id="zoom-reset" title="Reset zoom">1:1</button>
+  <button class="ctrl-btn" id="collapse-all" title="Collapse all tables">&#x25B3;</button>
+  <button class="ctrl-btn" id="expand-all" title="Expand all tables">&#x25BD;</button>
+  <button class="ctrl-btn wide" id="relayout" title="Recompute a compact layout">Re-layout</button>
+  <button class="ctrl-btn wide" id="keys-only" title="Show only keys and relationship columns" aria-pressed="false">Keys only</button>
+</div>
+
+<!-- Legend -->
+<div class="legend">
+  <div class="legend-title">Layers</div>
+  {% for group_name, table_list in data.groups.items() %}
+  <div class="legend-item">
+    <div class="legend-dot" style="background: {{ colors.get(group_name, colors._default).header }};"></div>
+    <span>{{ group_name.replace('_', ' ').title() }} ({{ table_list | length }})</span>
+  </div>
+  {% endfor %}
+</div>
+
+<!-- Zoom indicator -->
+<div class="zoom-indicator" id="zoom-level">100%</div>
+
+<!-- Tooltip -->
+<div class="tooltip" id="tooltip"></div>
+<div class="join-detail" id="join-detail" hidden>
+  <strong>Selected join</strong>
+  <div id="join-label"></div>
+  <button id="clear-join" title="Clear selected join" aria-label="Clear selected join">&times;</button>
+</div>
+
+<!-- Diagram -->
+<div class="diagram-container" id="container">
+  <div class="diagram-canvas" id="canvas">
+    <svg class="edges-svg" id="edges-svg"></svg>
+  </div>
+</div>
+
+<!-- dagre from CDN (layered layout also works if the CDN is unavailable) -->
+<script src="https://cdn.jsdelivr.net/npm/@dagrejs/dagre@1.1.4/dist/dagre.min.js"></script>
+<script>
+{% include "layout.js" %}
+(function() {
+  'use strict';
+
+  // ── Data injection ────────────────────────────────────────────
+  const MODEL = {{ data | tojson }};
+  const COLORS = {{ colors | tojson }};
+  const LAYOUT_DIR = "{{ layout }}";
+  const tableByName = Object.fromEntries(MODEL.tables.map(table => [table.name, table]));
+  const tableStages = DBMLLayout.stages(MODEL);
+  const hasLayers = MODEL.tables.some(table => DBMLLayout.stageName(table.group) !== null || DBMLLayout.stageName(table.name) !== null);
+  const stageCount = new Set(MODEL.tables.map(table => tableStages[table.name] ?? 3)).size;
+  const joinColumns = new Set(MODEL.refs.flatMap(ref => [JSON.stringify([ref.from_table, ref.from_column]), JSON.stringify([ref.to_table, ref.to_column])]));
+  const stageColors = [COLORS.source_layer, COLORS.seed_layer, COLORS.prep_layer, COLORS.intermediate_layer, COLORS.bridge_layer, COLORS.mart_layer];
+  const visualGroups = DBMLLayout.groups(MODEL, tableStages);
+  const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+
+  // ── DOM refs ──────────────────────────────────────────────────
+  const container = document.getElementById('container');
+  const canvas = document.getElementById('canvas');
+  const edgesSvg = document.getElementById('edges-svg');
+  const tooltip = document.getElementById('tooltip');
+  const zoomLevel = document.getElementById('zoom-level');
+
+  // ── State ─────────────────────────────────────────────────────
+  let scale = 1, tx = 0, ty = 0;
+  let isPanning = false, isDragging = false;
+  let panStartX, panStartY, panStartTx, panStartTy;
+  let dragNode = null, dragStartX, dragStartY, dragStartLeft, dragStartTop;
+  let selectedJoin = null;
+  const nodeElements = {};   // tableName -> DOM element
+  const nodePositions = {};  // tableName -> { x, y, w, h }
+
+  function getColor(group) {
+    return COLORS[group] || stageColors[DBMLLayout.stageName(group)] || COLORS._default;
+  }
+  function tableColor(table) {
+    const groupColor = table.group !== '_default' && COLORS[table.group];
+    if (groupColor && (MODEL.group_colors?.[table.group] || DBMLLayout.stageName(table.group) === tableStages[table.name])) return groupColor;
+    return stageColors[tableStages[table.name]] || getColor(table.group);
+  }
+  function groupColor(group) {
+    const namedStage = DBMLLayout.stageName(group.group);
+    if (group.group === '_default' || (namedStage !== null && namedStage !== group.stage)) return stageColors[group.stage];
+    return getColor(group.group);
+  }
+  function renderLegend() {
+    const legend = document.querySelector('.legend');
+    legend.hidden = !visualGroups.length;
+    legend.innerHTML = '<div class="legend-title">Groups</div>' + visualGroups.map(group => `<div class="legend-item"><div class="legend-dot" style="background:${groupColor(group).header}"></div><span>${escapeHtml(group.name)} (${group.members.length})</span></div>`).join('');
+  }
+  function dimensions() {
+    return Object.fromEntries(MODEL.tables.map(table => {
+      const el = nodeElements[table.name];
+      const ports = {};
+      el.querySelectorAll('.column-row').forEach(row => {
+        ports[row.dataset.column] = el.classList.contains('collapsed') ? el.querySelector('.table-header').offsetHeight / 2 : row.offsetTop + row.offsetHeight / 2;
+      });
+      return [table.name, { w: el.offsetWidth, h: el.offsetHeight, ports }];
+    }));
+  }
+  function computeLayout() {
+    const sizes = dimensions();
+    const initial = {};
+    if (typeof dagre !== 'undefined' && MODEL.tables.length) {
+      const grouped = LAYOUT_DIR === 'TB' || !hasLayers || stageCount < 2;
+      const g = new dagre.graphlib.Graph({ compound: grouped });
+      g.setGraph({ rankdir: LAYOUT_DIR, nodesep: 36, ranksep: 100, marginx: 72, marginy: 120 });
+      g.setDefaultEdgeLabel(() => ({}));
+      // Cluster IDs cannot collide with table names used as graph IDs.
+      const clusters = new Map();
+      if (grouped) visualGroups.forEach((group, i) => {
+        let id = '__dbml_group_' + i;
+        while (tableByName[id]) id += '_';
+        group.members.forEach(name => clusters.set(name, id)); g.setNode(id, {});
+      });
+      MODEL.tables.forEach(table => {
+        g.setNode(table.name, { width: sizes[table.name].w, height: sizes[table.name].h });
+        if (clusters.has(table.name)) g.setParent(table.name, clusters.get(table.name));
+      });
+      MODEL.refs.forEach(ref => {
+        if (!tableByName[ref.from_table] || !tableByName[ref.to_table]) return;
+        // Use dependency -> dependent for generic diagrams. In layer diagrams
+        // use semantic order solely for positioning; ref arrows are unchanged.
+        const a = tableStages[ref.from_table], b = tableStages[ref.to_table];
+        const forward = hasLayers && a !== null && b !== null && DBMLLayout.columnIndex(a) < DBMLLayout.columnIndex(b);
+        g.setEdge(forward ? ref.from_table : ref.to_table, forward ? ref.to_table : ref.from_table);
+      });
+      dagre.layout(g);
+      MODEL.tables.forEach(table => {
+        const node = g.node(table.name);
+        initial[table.name] = { x: node.x - node.width / 2, y: node.y - node.height / 2, ...sizes[table.name] };
+      });
+    }
+    const layered = (LAYOUT_DIR === 'LR' && hasLayers && stageCount > 1) || !Object.keys(initial).length;
+    const positions = layered ? DBMLLayout.layered(MODEL, sizes, tableStages, initial) : initial;
+    if (layered && LAYOUT_DIR === 'TB') {
+      // Offline fallback: keep cards upright and stack complete lanes vertically.
+      let y = 120;
+      DBMLLayout.columns.forEach(stages => {
+        const names = MODEL.tables.filter(t => stages.includes(tableStages[t.name] ?? 3)).map(t => t.name);
+        let x = 72, height = 0;
+        names.forEach(name => { positions[name] = { x, y, ...sizes[name] }; x += sizes[name].w + 48; height = Math.max(height, sizes[name].h); });
+        if (names.length) y += height + 110;
+      });
+    }
+    Object.assign(nodePositions, positions);
+    MODEL.tables.forEach(table => {
+      const p = nodePositions[table.name], el = nodeElements[table.name];
+      el.style.left = p.x + 'px'; el.style.top = p.y + 'px';
+    });
+  }
+
+  // ── Render table nodes ────────────────────────────────────────
+  function renderTables() {
+    MODEL.tables.forEach(table => {
+      const pos = nodePositions[table.name] = { x: 0, y: 0, w: 0, h: 0 };
+      const color = tableColor(table);
+      const div = document.createElement('div');
+      div.className = 'table-node';
+      div.dataset.table = table.name;
+      div.style.left = pos.x + 'px';
+      div.style.top = pos.y + 'px';
+
+      div.innerHTML = `
+        <div class="table-header" style="background:${color.header}"
+             data-note="${escapeHtml(table.note)}">
+          <span class="table-name">${escapeHtml(table.name)}</span>
+          <span class="toggle-icon">&#x25BC;</span>
+        </div>
+        <div class="table-columns">
+          ${table.columns.map(c => `
+            <div class="column-row ${c.pk || c.fk || joinColumns.has(JSON.stringify([table.name, c.name])) ? 'join-column' : ''}" data-column="${escapeHtml(c.name)}" data-note="${escapeHtml(c.note)}">
+              <span class="col-name">${escapeHtml(c.name)}</span>
+              <span class="col-type">${escapeHtml(c.type)}</span>
+              ${c.pk ? '<span class="badge badge-pk">PK</span>' : ''}
+              ${c.fk ? '<span class="badge badge-fk">FK</span>' : ''}
+              ${c.not_null ? '<span class="badge badge-nn">NN</span>' : ''}
+            </div>`).join('')}
+        </div>`;
+
+      canvas.appendChild(div);
+      nodeElements[table.name] = div;
+
+      // Update measured dimensions to match actual rendered size
+      const rect = div.getBoundingClientRect();
+      pos.w = rect.width / scale;
+      pos.h = rect.height / scale;
+    });
+  }
+
+  // ── Render group backgrounds ──────────────────────────────────
+  const groupElements = {};
+  function renderGroups() {
+    // Remove old group elements
+    Object.values(groupElements).forEach(el => el.remove());
+
+    visualGroups.forEach(group => {
+      const { key } = group;
+      const members = group.members.filter(t => nodePositions[t]);
+      if (members.length === 0) return;
+
+      const pad = 30;
+      const headerH = 30;  // height of the group header bar
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      members.forEach(t => {
+        const p = nodePositions[t];
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x + p.w);
+        maxY = Math.max(maxY, p.y + p.h);
+      });
+
+      const color = groupColor(group);
+      const div = document.createElement('div');
+      div.className = 'group-bg';
+      div.dataset.group = key;
+      div.style.left = (minX - pad) + 'px';
+      div.style.top = (minY - pad - headerH) + 'px';
+      div.style.width = (maxX - minX + pad * 2) + 'px';
+      div.style.height = (maxY - minY + pad * 2 + headerH) + 'px';
+      div.style.background = color.header + '0c';
+      div.style.borderColor = color.header + '55';
+
+      const displayName = group.name;
+      div.innerHTML = `<div class="group-header" style="background:${color.header}"><span>${escapeHtml(displayName)}</span><span class="group-count">${members.length} table${members.length !== 1 ? 's' : ''}</span></div>`;
+      canvas.insertBefore(div, canvas.firstChild);
+      groupElements[key] = div;
+    });
+  }
+
+  // ── Render edges (SVG) ────────────────────────────────────────
+
+  // Get the connection point for a specific column within a table.
+  // side = 'left' or 'right' — determined by caller based on where
+  // the linked table sits relative to this one.
+  // Falls back to header center when collapsed or column not found.
+  function getConnectionPoint(tableName, colName, side, fan = 0) {
+    const p = nodePositions[tableName];
+    if (!p) return { x: 0, y: 0 };
+    const el = nodeElements[tableName];
+    if (!el) return { x: side === 'right' ? p.x + p.w : p.x, y: p.y + p.h / 2 };
+
+    const isCollapsed = el.classList.contains('collapsed');
+    let y;
+
+    if (!isCollapsed && colName) {
+      const colRow = Array.from(el.querySelectorAll('.column-row')).find(row => row.dataset.column === colName);
+      if (colRow) {
+        y = p.y + colRow.offsetTop + colRow.offsetHeight / 2;
+      }
+    }
+
+    if (y === undefined) {
+      const header = el.querySelector('.table-header');
+      y = p.y + (header ? header.offsetHeight / 2 : 18);
+    }
+
+    const x = side === 'right' ? p.x + p.w : p.x;
+    return { x, y: y + fan };
+  }
+
+  function renderEdges() {
+    const ns = 'http://www.w3.org/2000/svg';
+
+    // Compute canvas bounds for SVG sizing
+    let maxX = 0, maxY = 0;
+    MODEL.tables.forEach(t => {
+      const p = nodePositions[t.name];
+      if (p) {
+        maxX = Math.max(maxX, p.x + p.w + 200);
+        maxY = Math.max(maxY, p.y + p.h + 200);
+      }
+    });
+    edgesSvg.setAttribute('width', maxX);
+    edgesSvg.setAttribute('height', maxY);
+
+    // Clear existing (removeChild is safer than innerHTML for SVG)
+    while (edgesSvg.firstChild) edgesSvg.removeChild(edgesSvg.firstChild);
+
+    // Arrowhead marker
+    const defs = document.createElementNS(ns, 'defs');
+
+    // Relationships have their own colors so adjacent joins remain traceable.
+    const edgeColors = ['#66BED8', '#D5AC68', '#7CC8A4', '#AA9AE3', '#D991BB', '#92AEDD', '#D3C77C', '#7BC6C5'];
+    const markerColors = new Set(edgeColors);
+    markerColors.forEach(color => {
+      const marker = document.createElementNS(ns, 'marker');
+      const id = 'arrow-' + color.replace('#', '');
+      marker.setAttribute('id', id);
+      marker.setAttribute('viewBox', '0 0 10 10');
+      marker.setAttribute('refX', '10');
+      marker.setAttribute('refY', '5');
+      marker.setAttribute('markerWidth', '6');
+      marker.setAttribute('markerHeight', '6');
+      marker.setAttribute('orient', 'auto-start-reverse');
+      const path = document.createElementNS(ns, 'path');
+      path.setAttribute('d', 'M 0 0 L 10 5 L 0 10 Z');
+      path.setAttribute('fill', color);
+      marker.appendChild(path);
+      defs.appendChild(marker);
+    });
+    edgesSvg.appendChild(defs);
+
+    const boxes = [...Object.values(nodePositions), ...Object.values(groupElements).map(el => ({
+      x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth,
+      h: el.querySelector('.group-header').offsetHeight,
+    }))];
+    const occupied = [];
+    const endpointKey = (table, column) => JSON.stringify([table, nodeElements[table]?.classList.contains('collapsed') ? '' : column]);
+    const incidences = new Map();
+    MODEL.refs.forEach((ref, index) => {
+      [[ref.from_table, ref.from_column, 'from'], [ref.to_table, ref.to_column, 'to']].forEach(([table, column, end]) => {
+        const key = endpointKey(table, column);
+        if (!incidences.has(key)) incidences.set(key, []);
+        incidences.get(key).push(index + ':' + end);
+      });
+    });
+    function fanOffset(table, column, index, end) {
+      const entries = incidences.get(endpointKey(table, column));
+      const el = nodeElements[table];
+      const row = el.classList.contains('collapsed') ? el.querySelector('.table-header') : Array.from(el.querySelectorAll('.column-row')).find(row => row.dataset.column === column);
+      const span = Math.min(20, (row?.offsetHeight || 24) - 8);
+      return entries.length < 2 ? 0 : (entries.indexOf(index + ':' + end) / (entries.length - 1) - 0.5) * span;
+    }
+    MODEL.refs.forEach((ref, index) => {
+      const fromPos = nodePositions[ref.from_table];
+      const toPos = nodePositions[ref.to_table];
+      if (!fromPos || !toPos) return;
+
+      const lane = index;
+      const choices = [];
+      // Same-column joins may be shorter on either outside edge. Try every
+      // port orientation and choose the shortest obstacle-free route.
+      ['left', 'right'].forEach(fromSide => ['left', 'right'].forEach(toSide => {
+        const from = getConnectionPoint(ref.from_table, ref.from_column, fromSide, fanOffset(ref.from_table, ref.from_column, index, 'from'));
+        const to = getConnectionPoint(ref.to_table, ref.to_column, toSide, fanOffset(ref.to_table, ref.to_column, index, 'to'));
+        if (ref.from_table === ref.to_table && fromSide !== toSide) return;
+        const points = DBMLLayout.route(from, to, fromSide, toSide, boxes, lane, occupied);
+        const collisions = points.slice(1).reduce((sum, p, i) => sum + boxes.filter(box => DBMLLayout.intersects(points[i], p, box)).length, 0);
+        choices.push({ points, score: DBMLLayout.routeCost(points, occupied) + collisions * 100000 });
+      }));
+      choices.sort((a, b) => a.score - b.score);
+      const points = choices[0].points;
+      occupied.push(points);
+      const d = points.map((p, i) => `${i ? 'L' : 'M'} ${p.x} ${p.y}`).join(' ');
+      const color = edgeColors[index % edgeColors.length];
+      const markerId = 'arrow-' + color.replace('#', '');
+
+      const path = document.createElementNS(ns, 'path');
+      path.setAttribute('d', d);
+      path.setAttribute('class', 'edge-path');
+      path.setAttribute('stroke', color);
+      path.setAttribute('marker-end', `url(#${markerId})`);
+      path.dataset.from = ref.from_table;
+      path.dataset.fromCol = ref.from_column;
+      path.dataset.to = ref.to_table;
+      path.dataset.toCol = ref.to_column;
+      path.dataset.label = `${ref.from_table}.${ref.from_column}\n→ ${ref.to_table}.${ref.to_column}`;
+      path.dataset.index = index;
+      const group = document.createElementNS(ns, 'g');
+      group.setAttribute('class', 'edge');
+      const halo = document.createElementNS(ns, 'path');
+      halo.setAttribute('d', d); halo.setAttribute('class', 'edge-halo');
+      const hit = document.createElementNS(ns, 'path');
+      hit.setAttribute('d', d); hit.setAttribute('class', 'edge-hit');
+      group.append(halo, path, hit);
+      points.filter((_, i) => i === 0 || i === points.length - 1).forEach(point => {
+        const port = document.createElementNS(ns, 'circle');
+        port.setAttribute('cx', point.x); port.setAttribute('cy', point.y);
+        port.setAttribute('r', '2.6'); port.setAttribute('fill', color);
+        port.setAttribute('class', 'edge-port'); group.appendChild(port);
+      });
+      edgesSvg.appendChild(group);
+    });
+    if (selectedJoin !== null) traceJoin(selectedJoin);
+  }
+
+  // ── Transform helper ──────────────────────────────────────────
+  function applyTransform() {
+    canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+    zoomLevel.textContent = Math.round(scale * 100) + '%';
+  }
+
+  // ── Group drag state ───────────────────────────────────────────
+  let isDraggingGroup = false;
+  let dragGroupName = null;
+  let dragGroupStartX, dragGroupStartY;
+  let dragGroupMemberStarts = {};  // tableName -> { x, y }
+
+  // ── Pan ───────────────────────────────────────────────────────
+  container.addEventListener('mousedown', e => {
+    if (e.target.closest('.table-node')) return;
+    if (e.target.closest('.edge')) return;
+
+    // Group header drag
+    const groupHeader = e.target.closest('.group-header');
+    if (groupHeader) {
+      const groupDiv = groupHeader.closest('.group-bg');
+      dragGroupName = groupDiv.dataset.group;
+      isDraggingGroup = true;
+      dragGroupStartX = e.clientX;
+      dragGroupStartY = e.clientY;
+      // Snapshot starting positions of all member tables
+      dragGroupMemberStarts = {};
+      (visualGroups.find(group => group.key === dragGroupName)?.members || []).forEach(tName => {
+        const p = nodePositions[tName];
+        if (p) dragGroupMemberStarts[tName] = { x: p.x, y: p.y };
+      });
+      return;
+    }
+
+    isPanning = true;
+    container.classList.add('grabbing');
+    panStartX = e.clientX;
+    panStartY = e.clientY;
+    panStartTx = tx;
+    panStartTy = ty;
+  });
+
+  window.addEventListener('mousemove', e => {
+    // Tooltip tracking
+    tooltip.style.left = (e.clientX + 12) + 'px';
+    tooltip.style.top = (e.clientY + 12) + 'px';
+
+    if (isPanning) {
+      tx = panStartTx + (e.clientX - panStartX);
+      ty = panStartTy + (e.clientY - panStartY);
+      applyTransform();
+      return;
+    }
+
+    // Group drag: move all member tables together
+    if (isDraggingGroup && dragGroupName) {
+      const dx = (e.clientX - dragGroupStartX) / scale;
+      const dy = (e.clientY - dragGroupStartY) / scale;
+      Object.entries(dragGroupMemberStarts).forEach(([tName, start]) => {
+        const newX = start.x + dx;
+        const newY = start.y + dy;
+        nodePositions[tName].x = newX;
+        nodePositions[tName].y = newY;
+        const el = nodeElements[tName];
+        if (el) {
+          el.style.left = newX + 'px';
+          el.style.top = newY + 'px';
+        }
+      });
+      renderGroups();
+      renderEdges();
+      return;
+    }
+
+    if (isDragging && dragNode) {
+      const dx = (e.clientX - dragStartX) / scale;
+      const dy = (e.clientY - dragStartY) / scale;
+      const newLeft = dragStartLeft + dx;
+      const newTop = dragStartTop + dy;
+      dragNode.style.left = newLeft + 'px';
+      dragNode.style.top = newTop + 'px';
+
+      const name = dragNode.dataset.table;
+      nodePositions[name].x = newLeft;
+      nodePositions[name].y = newTop;
+
+      renderGroups();
+      renderEdges();
+    }
+  });
+
+  // ── Zoom ──────────────────────────────────────────────────────
+  container.addEventListener('wheel', e => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+    const newScale = Math.min(3, Math.max(0.1, scale * factor));
+
+    // Zoom toward cursor
+    const rect = container.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    tx = cx - (cx - tx) * (newScale / scale);
+    ty = cy - (cy - ty) * (newScale / scale);
+    scale = newScale;
+    applyTransform();
+  }, { passive: false });
+
+  // ── Table drag + Expand/Collapse (unified) ─────────────────────
+  // mousedown anywhere on a table starts tracking; on mouseup we
+  // decide: moved > 3px = drag, otherwise if header was clicked = toggle.
+  const DRAG_THRESHOLD = 3;
+  let mouseDownOnHeader = false;
+
+  canvas.addEventListener('mousedown', e => {
+    const node = e.target.closest('.table-node');
+    if (!node) return;
+
+    dragNode = node;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    dragStartLeft = parseFloat(node.style.left);
+    dragStartTop = parseFloat(node.style.top);
+    isDragging = true;
+    mouseDownOnHeader = !!e.target.closest('.table-header');
+    e.stopPropagation();
+  });
+
+  window.addEventListener('mouseup', e => {
+    if (isDragging && dragNode) {
+      const movedX = Math.abs(e.clientX - dragStartX);
+      const movedY = Math.abs(e.clientY - dragStartY);
+
+      if (movedX <= DRAG_THRESHOLD && movedY <= DRAG_THRESHOLD) {
+        // Was a click, not a drag — snap back position (in case of micro-move)
+        dragNode.style.left = dragStartLeft + 'px';
+        dragNode.style.top = dragStartTop + 'px';
+        const name = dragNode.dataset.table;
+        nodePositions[name].x = dragStartLeft;
+        nodePositions[name].y = dragStartTop;
+
+        // Toggle collapse if click was on header
+        if (mouseDownOnHeader) {
+          const node = dragNode;  // capture before dragNode is nulled
+          node.classList.toggle('collapsed');
+          requestAnimationFrame(() => {
+            nodePositions[name].h = node.offsetHeight;
+            renderGroups();
+            renderEdges();
+          });
+        }
+      }
+    }
+
+    isPanning = false;
+    isDragging = false;
+    isDraggingGroup = false;
+    dragNode = null;
+    dragGroupName = null;
+    container.classList.remove('grabbing');
+  });
+
+  // ── Tooltips ──────────────────────────────────────────────────
+  canvas.addEventListener('mouseover', e => {
+    // Column tooltip
+    const colRow = e.target.closest('.column-row');
+    if (colRow && colRow.dataset.note) {
+      tooltip.textContent = colRow.dataset.note;
+      tooltip.style.display = 'block';
+      return;
+    }
+    // Table header tooltip
+    const header = e.target.closest('.table-header');
+    if (header && header.dataset.note) {
+      tooltip.textContent = header.dataset.note;
+      tooltip.style.display = 'block';
+      return;
+    }
+  });
+  canvas.addEventListener('mouseout', e => {
+    if (e.target.closest('.column-row') || e.target.closest('.table-header')) {
+      tooltip.style.display = 'none';
+    }
+  });
+
+  // Hover to trace; click to keep the relationship highlighted while navigating.
+  function traceJoin(index) {
+    canvas.querySelectorAll('.dimmed, .highlighted').forEach(el => el.classList.remove('dimmed', 'highlighted'));
+    Object.values(nodeElements).forEach(el => {
+      el.style.boxShadow = '';
+      el.querySelectorAll('.column-row').forEach(row => row.style.background = '');
+    });
+    if (index === null) return;
+    const path = edgesSvg.querySelector(`.edge-path[data-index="${index}"]`);
+    if (!path) return;
+    path.classList.add('highlighted');
+    Object.entries(nodeElements).forEach(([name, el]) => el.classList.toggle('dimmed', name !== path.dataset.from && name !== path.dataset.to));
+    edgesSvg.querySelectorAll('.edge').forEach(el => el.classList.toggle('dimmed', el !== path.parentElement));
+    const color = path.getAttribute('stroke');
+    [[path.dataset.from, path.dataset.fromCol], [path.dataset.to, path.dataset.toCol]].forEach(([table, column]) => {
+      const el = nodeElements[table];
+      if (!el) return;
+      el.style.boxShadow = '0 0 0 2px ' + color;
+      const row = Array.from(el.querySelectorAll('.column-row')).find(row => row.dataset.column === column);
+      if (row) row.style.background = color + '22';
+    });
+  }
+  function selectJoin(index) {
+    selectedJoin = index;
+    traceJoin(index);
+    const panel = document.getElementById('join-detail');
+    panel.hidden = index === null;
+    if (index !== null) {
+      const ref = MODEL.refs[index];
+      document.getElementById('join-label').textContent = `${ref.from_table}.${ref.from_column} → ${ref.to_table}.${ref.to_column}`;
+    }
+    tooltip.style.display = 'none';
+  }
+  edgesSvg.addEventListener('mouseover', e => {
+    const edge = e.target.closest('.edge');
+    if (!edge || edge === e.relatedTarget?.closest?.('.edge')) return;
+    const path = edge.querySelector('.edge-path');
+    if (selectedJoin === null) traceJoin(Number(path.dataset.index));
+    tooltip.textContent = path.dataset.label + '\nClick to keep this join highlighted';
+    tooltip.style.display = 'block';
+  });
+  edgesSvg.addEventListener('mouseout', e => {
+    const edge = e.target.closest('.edge');
+    if (!edge || edge === e.relatedTarget?.closest?.('.edge')) return;
+    if (selectedJoin === null) traceJoin(null);
+    tooltip.style.display = 'none';
+  });
+  edgesSvg.addEventListener('click', e => {
+    const path = e.target.closest('.edge')?.querySelector('.edge-path');
+    if (!path) return;
+    const index = Number(path.dataset.index);
+    selectJoin(selectedJoin === index ? null : index);
+    e.stopPropagation();
+  });
+  document.getElementById('clear-join').addEventListener('click', () => selectJoin(null));
+  window.addEventListener('keydown', e => { if (e.key === 'Escape') selectJoin(null); });
+
+  // ── Control buttons ───────────────────────────────────────────
+  document.getElementById('zoom-in').addEventListener('click', () => {
+    scale = Math.min(3, scale * 1.25);
+    applyTransform();
+  });
+  document.getElementById('zoom-out').addEventListener('click', () => {
+    scale = Math.max(0.1, scale / 1.25);
+    applyTransform();
+  });
+  document.getElementById('zoom-reset').addEventListener('click', () => {
+    scale = 1; tx = 0; ty = 0;
+    applyTransform();
+  });
+  document.getElementById('zoom-fit').addEventListener('click', fitToScreen);
+  document.getElementById('relayout').addEventListener('click', () => {
+    computeLayout(); renderGroups(); renderEdges(); fitToScreen();
+  });
+  document.getElementById('keys-only').addEventListener('click', event => {
+    const enabled = event.currentTarget.getAttribute('aria-pressed') !== 'true';
+    event.currentTarget.setAttribute('aria-pressed', String(enabled));
+    event.currentTarget.classList.toggle('active', enabled);
+    event.currentTarget.textContent = enabled ? 'All columns' : 'Keys only';
+    Object.values(nodeElements).forEach(el => el.classList.toggle('keys-only', enabled));
+    computeLayout(); renderGroups(); renderEdges(); fitToScreen();
+  });
+  document.getElementById('collapse-all').addEventListener('click', () => {
+    document.querySelectorAll('.table-node').forEach(n => n.classList.add('collapsed'));
+    requestAnimationFrame(() => {
+      MODEL.tables.forEach(t => {
+        const el = nodeElements[t.name];
+        if (el) nodePositions[t.name].h = el.offsetHeight;
+      });
+      computeLayout();
+      renderGroups();
+      renderEdges();
+      fitToScreen();
+    });
+  });
+  document.getElementById('expand-all').addEventListener('click', () => {
+    document.querySelectorAll('.table-node').forEach(n => n.classList.remove('collapsed'));
+    requestAnimationFrame(() => {
+      MODEL.tables.forEach(t => {
+        const el = nodeElements[t.name];
+        if (el) nodePositions[t.name].h = el.offsetHeight;
+      });
+      computeLayout();
+      renderGroups();
+      renderEdges();
+      fitToScreen();
+    });
+  });
+
+  function fitToScreen() {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    MODEL.tables.forEach(t => {
+      const p = nodePositions[t.name];
+      if (!p) return;
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x + p.w);
+      maxY = Math.max(maxY, p.y + p.h);
+    });
+
+    if (!Number.isFinite(minX)) { scale = 1; tx = 0; ty = 0; applyTransform(); return; }
+    // Include group headers in the fitted bounds.
+    Object.values(groupElements).forEach(el => {
+      minX = Math.min(minX, el.offsetLeft); minY = Math.min(minY, el.offsetTop);
+      maxX = Math.max(maxX, el.offsetLeft + el.offsetWidth); maxY = Math.max(maxY, el.offsetTop + el.offsetHeight);
+    });
+    const contentW = Math.max(1, maxX - minX);
+    const contentH = Math.max(1, maxY - minY);
+    const viewW = container.clientWidth;
+    const viewH = container.clientHeight;
+    const margin = 80;
+
+    scale = Math.min(
+      Math.max(1, viewW - margin * 2) / contentW,
+      Math.max(1, viewH - margin * 2 - 40) / contentH,
+      1.5
+    );
+    tx = (viewW - contentW * scale) / 2 - minX * scale;
+    ty = (viewH - contentH * scale) / 2 + 20 - minY * scale;
+    applyTransform();
+  }
+
+  // ── Initialize ────────────────────────────────────────────────
+  renderLegend();
+  renderTables();
+  computeLayout();
+  renderGroups();
+  renderEdges();
+
+  if (!MODEL.tables.length) {
+    const message = document.createElement('div'); message.className = 'empty-message';
+    message.textContent = 'No tables in this DBML file.'; container.appendChild(message);
+  }
+  window.addEventListener('resize', fitToScreen);
+
+  // Fit to screen on load
+  requestAnimationFrame(() => {
+    // Re-measure actual rendered heights
+    MODEL.tables.forEach(t => {
+      const el = nodeElements[t.name];
+      if (el) {
+        nodePositions[t.name].w = el.offsetWidth;
+        nodePositions[t.name].h = el.offsetHeight;
+      }
+    });
+    renderGroups();
+    renderEdges();
+    fitToScreen();
+  });
+
+})();
+</script>
+</body>
+</html>

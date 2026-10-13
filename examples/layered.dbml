@@ -1,0 +1,105 @@
+Project layered_warehouse {
+  database_type: 'Snowflake'
+  Note: 'A small warehouse for reviewing layer placement and join routing.'
+}
+
+Table source_customers {
+  customer_id int [pk]
+  email varchar
+  created_at timestamp
+}
+Table seed_order_status {
+  status_code varchar [pk]
+  status_name varchar
+}
+Table prepared_orders {
+  order_id int [pk]
+  customer_id int
+  status_code varchar
+  order_date date
+  amount decimal
+}
+Table stg_order_items {
+  item_id int [pk]
+  order_id int
+  product_id int
+  quantity int
+}
+Table raw_products {
+  product_id int [pk]
+  product_name varchar
+  category varchar
+}
+Table int_customer_orders {
+  customer_id int [pk]
+  order_id int
+  order_date date
+  amount decimal
+}
+Table inter_order_lines {
+  item_id int [pk]
+  order_id int
+  product_id int
+  net_amount decimal
+}
+Table intermediate_products {
+  product_id int [pk]
+  product_name varchar
+  category varchar
+}
+Table marts_customers {
+  customer_id int [pk]
+  lifetime_value decimal
+  order_count int
+}
+Table marts_products {
+  product_id int [pk]
+  product_name varchar
+  category varchar
+}
+Table bridge_customer_products {
+  customer_id int
+  product_id int
+  first_purchased_at date
+}
+Table reports_revenue {
+  order_id int
+  customer_id int
+  net_revenue decimal
+}
+
+TableGroup prep_layer {
+  source_customers
+  prepared_orders
+  stg_order_items
+  raw_products
+}
+TableGroup seeds {
+  seed_order_status
+}
+TableGroup intermediate_layer {
+  int_customer_orders
+  inter_order_lines
+  intermediate_products
+}
+TableGroup mart_layer {
+  marts_customers
+  marts_products
+  bridge_customer_products
+  reports_revenue
+}
+
+Ref: prepared_orders.customer_id > source_customers.customer_id
+Ref: prepared_orders.status_code > seed_order_status.status_code
+Ref: stg_order_items.order_id > prepared_orders.order_id
+Ref: stg_order_items.product_id > raw_products.product_id
+Ref: int_customer_orders.customer_id > source_customers.customer_id
+Ref: int_customer_orders.order_id > prepared_orders.order_id
+Ref: inter_order_lines.item_id > stg_order_items.item_id
+Ref: intermediate_products.product_id > raw_products.product_id
+Ref: marts_customers.customer_id > int_customer_orders.customer_id
+Ref: marts_products.product_id > intermediate_products.product_id
+Ref: bridge_customer_products.customer_id > marts_customers.customer_id
+Ref: bridge_customer_products.product_id > marts_products.product_id
+Ref: reports_revenue.order_id > inter_order_lines.order_id
+Ref: reports_revenue.customer_id > source_customers.customer_id
