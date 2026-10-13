@@ -25,9 +25,9 @@ def _files(root: Path, *args: str) -> set[str]:
     return set(filter(None, _git(root, *args, strip=False).split("\0")))
 
 
-def _model_paths(root: Path, files: set[str], base: str) -> tuple[list[PurePosixPath], list[Path], list[PurePosixPath]]:
+def _model_paths(root: Path, files: set[str], base: str) -> tuple[list[PurePosixPath], list[Path], list[PurePosixPath], list[PurePosixPath]]:
     """Read model-paths from dbt projects, including a deleted project's baseline."""
-    directories, manifests, upstream = [], [], []
+    directories, manifests, upstream, seeds = [], [], [], []
     projects = sorted(name for name in files if PurePosixPath(name).name == "dbt_project.yml")
     for name in projects:
         config_path = root / name
@@ -40,6 +40,7 @@ def _model_paths(root: Path, files: set[str], base: str) -> tuple[list[PurePosix
         for text in texts:
             config = yaml.safe_load(text) or {}
             directories.extend(parent / directory for directory in config.get("model-paths", ["models"]))
+            seeds.extend(parent / directory for directory in config.get("seed-paths", ["seeds"]))
             upstream.extend(parent / directory for key, default in (("seed-paths", "seeds"), ("snapshot-paths", "snapshots"))
                             for directory in config.get(key, [default]))
         config = yaml.safe_load(texts[0]) or {}
@@ -53,7 +54,8 @@ def _model_paths(root: Path, files: set[str], base: str) -> tuple[list[PurePosix
         upstream = sorted({PurePosixPath(*PurePosixPath(name).parts[:i + 1])
                            for name in files for i, part in enumerate(PurePosixPath(name).parts[:-1])
                            if part in ("seeds", "snapshots")})
-    return directories, manifests, upstream
+        seeds = [directory for directory in upstream if directory.name == "seeds"]
+    return directories, manifests, upstream, seeds
 
 
 def _identifiers(name: str, alias: str | None = None, schema: str | None = None) -> list[str]:
@@ -83,7 +85,7 @@ def _manifest_names(root: Path, manifests: list[Path], warnings: list[str]) -> t
                 continue
             if node.get("resource_type") in ("source", "seed", "snapshot"):
                 external.update(_identifiers(node["name"], node.get("identifier") or node.get("alias"), node.get("schema")))
-            if node.get("resource_type") != "model" or not node.get("original_file_path"):
+            if node.get("resource_type") not in ("model", "seed") or not node.get("original_file_path"):
                 continue
             source = (project / node["original_file_path"]).relative_to(root).as_posix()
             alias = node.get("alias") or node["name"]
@@ -126,7 +128,7 @@ def _project_names(root: Path, files: set[str], base: str, warnings: list[str],
                         config = {}
                     identifiers = _identifiers(item["name"], config.get("alias"), config.get("schema"))
                     names.update(identifiers)
-                    if kind == "models":
+                    if kind in ("models", "seeds"):
                         aliases.setdefault(item["name"], []).extend(identifiers)
             for item in data.get("sources", []) or []:
                 if not isinstance(item, dict):
@@ -147,10 +149,12 @@ def _inline_names(text: str, stem: str) -> list[str]:
 
 
 def _external_table(table: dict) -> bool:
-    """Do not infer a missing upstream source/seed as a new transformation."""
+    """Exempt external inputs, while allowing proposed seeds in any layer group."""
     text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", table["name"] + " " + table.get("group", ""))
     tokens = set(re.split(r"[^a-z0-9]+", text.lower()))
-    return bool(tokens & {"source", "sources", "src", "raw", "seed", "seeds", "snapshot", "snapshots", "external", "landing", "reference"})
+    if tokens & {"seed", "seeds", "reference"}:
+        return False
+    return bool(tokens & {"source", "sources", "src", "raw", "snapshot", "snapshots", "external", "landing"})
 
 
 def _design_baseline(root: Path, base: str, files: set[str], dbml_path: Path | None,
@@ -178,7 +182,7 @@ def compare_sources(root: Path, current: dict, revision: str | None = None, *,
         working = _files(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
         tokens = _git(root, "diff", "--no-ext-diff", "--no-renames", "--name-status", "-z", base, "--", strip=False).split("\0")
         file_changes = {name: status for status, name in zip(tokens[::2], tokens[1::2]) if name}
-        directories, manifests, upstream = _model_paths(root, baseline | working, base)
+        directories, manifests, upstream, seeds = _model_paths(root, baseline | working, base)
         warnings = []
         aliases, external_names = _manifest_names(root, manifests, warnings)
         declared_names, declared_aliases = _project_names(root, baseline | working, base, warnings, baseline & file_changes.keys())
@@ -191,24 +195,33 @@ def compare_sources(root: Path, current: dict, revision: str | None = None, *,
             path = PurePosixPath(name)
             return path.suffix in (".sql", ".py") and any(path.is_relative_to(directory) for directory in directories)
 
+        def is_seed(name):
+            path = PurePosixPath(name)
+            return path.suffix == ".csv" and any(path.is_relative_to(directory) for directory in seeds)
+
+        def is_resource(name):
+            return is_model(name) or is_seed(name)
+
         # Inventory unchanged models as well as changed ones. A missing build or
         # manifest must not hide new design models or existing literal aliases.
         for name in sorted(baseline | working):
-            if not is_model(name):
+            if not is_resource(name):
                 continue
             stem = PurePosixPath(name).stem
             source = root / name
-            text = source.read_text() if source.is_file() else _git(root, "show", f"{base}:{name}") if name in baseline else ""
+            text = ""
+            if is_model(name):
+                text = source.read_text() if source.is_file() else _git(root, "show", f"{base}:{name}") if name in baseline else ""
             aliases[name] = _inline_names(text, stem) + declared_aliases.get(stem, []) + aliases.get(name, []) + [stem]
-            if source.is_file() and name in baseline and name in file_changes:
+            if is_model(name) and source.is_file() and name in baseline and name in file_changes:
                 aliases[name].extend(_inline_names(_git(root, "show", f"{base}:{name}"), stem))
             known_names.update(aliases[name])
 
         # Disable rename inference: file renames are removals/additions, and moves
         # preserving a model name are combined below into one modified model.
-        changed = {name: status for name, status in file_changes.items() if is_model(name)}
+        changed = {name: status for name, status in file_changes.items() if is_resource(name)}
         for name in working - baseline:
-            if is_model(name) and (root / name).is_file():
+            if is_resource(name) and (root / name).is_file():
                 changed[name] = "A"
 
         table_names = {table["name"] for table in current["tables"]}
@@ -227,7 +240,7 @@ def compare_sources(root: Path, current: dict, revision: str | None = None, *,
         # Do not mark a card when several live sources could own it.
         owners = {}
         for name in working:
-            if is_model(name) and (root / name).is_file():
+            if is_resource(name) and (root / name).is_file():
                 table = match(name)
                 if table:
                     owners.setdefault(table, set()).add(name)
@@ -262,7 +275,7 @@ def compare_sources(root: Path, current: dict, revision: str | None = None, *,
 
         # Only infer proposed models when an actual model project was found.
         # Ambiguous names remain known, so name matching never turns them new.
-        has_project = bool(directories) or any(PurePosixPath(name).name == "dbt_project.yml" for name in baseline | working)
+        has_project = bool(directories or seeds) or any(PurePosixPath(name).name == "dbt_project.yml" for name in baseline | working)
         if design_before is None and has_project:
             known_full = {item.casefold() for item in known_names}
             known_short = {item.rsplit(".", 1)[-1] for item in known_full}

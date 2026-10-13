@@ -246,7 +246,8 @@ sources:
         self.write("snapshots/history.sql", "select 1 as id\n")
         self.data = parse_dbml_text("Table customers {\n id int\n}\nTable landing_crm.click_events {\n id int\n}\nTable countries {\n id int\n}\nTable history {\n id int\n}\nTable src_external {\n id int\n}")
         changes = self.compare()
-        self.assertEqual(changes["counts"]["new"], 0)
+        self.assertEqual(changes["counts"]["new"], 1)
+        self.assertEqual(changes["tables"]["countries"]["status"], "new")
         self.assertEqual(changes["tables"]["customers"]["status"], "modified")
 
     def test_broken_manifest_falls_back_to_files(self):
@@ -326,6 +327,62 @@ sources:
         result = self.cli(path, "--baseline-dbml", self.root / "missing.dbml")
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_proposed_seed_is_new_without_csv_or_build(self):
+        for dbml in (
+            "Table seed_new_status {\n id int\n}",
+            "Table new_status__seed {\n id int\n}",
+            "Table new_status {\n id int\n}\nTableGroup seeds {\n new_status\n}",
+            "Table new_status {\n id int\n}\nTableGroup reference {\n new_status\n}",
+            "Table new_status__seed {\n id int\n}\nTableGroup sources {\n new_status__seed\n}",
+        ):
+            with self.subTest(dbml=dbml):
+                self.data = parse_dbml_text(dbml)
+                changes = self.compare()
+                name = self.data["tables"][0]["name"]
+                self.assertEqual(changes["tables"][name]["status"], "new")
+                self.assertIn("Proposed model", changes["tables"][name]["details"][0])
+
+    def test_existing_seed_stays_unchanged_but_csv_edits_are_modified(self):
+        self.git("switch", "main")
+        self.write("seeds/status__seed.csv", "id,label\n1,active\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "existing seed")
+        self.git("switch", "feature")
+        self.git("merge", "--ff-only", "main")
+        self.data = parse_dbml_text("Table status__seed {\n id int\n label varchar\n}")
+        self.assertEqual(self.compare()["tables"]["status__seed"]["status"], "unchanged")
+        self.write("seeds/status__seed.csv", "id,label\n1,active\n2,inactive\n")
+        changes = self.compare()
+        self.assertEqual(changes["tables"]["status__seed"]["status"], "modified")
+        self.assertEqual(changes["tables"]["status__seed"]["details"], ["Modified model source: seeds/status__seed.csv"])
+
+    def test_new_seed_csv_matches_yaml_alias_in_custom_seed_path(self):
+        self.write("dbt_project.yml", "name: demo\nmodel-paths: [models]\nseed-paths: [lookups]\n")
+        self.write("lookups/status.csv", "id\n1\n")
+        self.write("lookups/schema.yml", "seeds:\n  - name: status\n    config:\n      alias: seed_status\n")
+        self.data = parse_dbml_text("Table seed_status {\n id int\n}")
+        changes = self.compare()
+        self.assertEqual(changes["tables"]["seed_status"]["status"], "new")
+        self.assertEqual(changes["unmapped"], [])
+
+    def test_seed_manifest_alias_and_csv_removal(self):
+        self.git("switch", "main")
+        self.write("seeds/status.csv", "id\n1\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "seed")
+        self.git("switch", "feature")
+        self.git("merge", "--ff-only", "main")
+        self.write("target/manifest.json", json.dumps({"nodes": {
+            "seed.demo.status": {"resource_type": "seed", "name": "status", "alias": "seed_status",
+                                 "schema": "public", "original_file_path": "seeds/status.csv"},
+        }}))
+        self.data = parse_dbml_text("Table seed_status {\n id int\n}")
+        self.assertEqual(self.compare()["tables"]["seed_status"]["status"], "unchanged")
+        (self.root / "seeds/status.csv").unlink()
+        changes = self.compare()
+        self.assertEqual(changes["tables"]["seed_status"]["status"], "removed")
+        self.assertEqual(changes["unmapped"], [])
 
 
 if __name__ == "__main__":
