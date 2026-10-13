@@ -364,7 +364,8 @@
   <div class="project-meta">{{ data.tables | length }} tables &middot; {{ data.refs | length }} relationships &middot; {{ "Left to right" if layout == "LR" else "Top to bottom" }}</div>
   {% if data.comparison %}
   <div class="branch-toolbar">
-    <div class="branch-baseline">Changes since <strong>{{ data.comparison.revision }}</strong><small>{% if data.comparison.mode == 'sources' %}Model source changes{% else %}DBML schema changes{% endif %} · Merge base {{ data.comparison.base }} · Includes local edits</small></div>
+    <div class="branch-baseline">Changes since <strong>{{ data.comparison.revision }}</strong><small>{% if data.comparison.mode == 'hybrid' %}Model and design changes{% elif data.comparison.mode == 'sources' %}Model source changes{% else %}DBML schema changes{% endif %} · Merge base {{ data.comparison.base }} · Includes local edits</small></div>
+    {% if data.comparison.design_baseline %}<div class="branch-baseline"><small>Design baseline: {{ data.comparison.design_baseline }}</small></div>{% endif %}
     <div class="branch-counts">
       <span class="status-new">+ {{ data.comparison.counts.new }} new</span>
       <span class="status-modified">~ {{ data.comparison.counts.modified }} modified</span>
@@ -377,6 +378,8 @@
     </div>
     {% if not (data.comparison.counts.new + data.comparison.counts.modified + data.comparison.counts.removed) %}<div class="branch-baseline"><small>No model changes.</small></div>{% endif %}
     {% if data.comparison.unmapped %}<div class="branch-baseline"><small>{{ data.comparison.unmapped | length }} changed model source(s) have no unique diagram card. See Review for file paths.</small></div>{% endif %}
+    {% if data.comparison.design_baseline_missing %}<div class="branch-baseline"><small>No earlier DBML: design-only edits to existing models need a baseline.</small></div>{% endif %}
+    {% for warning in data.comparison.warnings | default([]) %}<div class="branch-baseline"><small>{{ warning }}</small></div>{% endfor %}
   </div>
   {% endif %}
 </div>

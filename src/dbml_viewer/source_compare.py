@@ -1,11 +1,13 @@
 """Map branch changes in model source files onto a generated DBML diagram."""
 
 import json
+import re
 from pathlib import Path, PurePosixPath
 
 import yaml
 
-from dbml_viewer.compare import _git, comparison_revision
+from dbml_viewer.compare import _git, compare_models, comparison_revision
+from dbml_viewer.parser import parse_dbml, parse_dbml_text
 
 
 def find_repository(path: Path, project_dir: Path | None = None) -> Path:
@@ -23,9 +25,9 @@ def _files(root: Path, *args: str) -> set[str]:
     return set(filter(None, _git(root, *args, strip=False).split("\0")))
 
 
-def _model_paths(root: Path, files: set[str], base: str) -> tuple[list[PurePosixPath], list[Path]]:
+def _model_paths(root: Path, files: set[str], base: str) -> tuple[list[PurePosixPath], list[Path], list[PurePosixPath]]:
     """Read model-paths from dbt projects, including a deleted project's baseline."""
-    directories, manifests = [], []
+    directories, manifests, upstream = [], [], []
     projects = sorted(name for name in files if PurePosixPath(name).name == "dbt_project.yml")
     for name in projects:
         config_path = root / name
@@ -38,6 +40,8 @@ def _model_paths(root: Path, files: set[str], base: str) -> tuple[list[PurePosix
         for text in texts:
             config = yaml.safe_load(text) or {}
             directories.extend(parent / directory for directory in config.get("model-paths", ["models"]))
+            upstream.extend(parent / directory for key, default in (("seed-paths", "seeds"), ("snapshot-paths", "snapshots"))
+                            for directory in config.get(key, [default]))
         config = yaml.safe_load(texts[0]) or {}
         manifests.append(root / parent / config.get("target-path", "target") / "manifest.json")
     if not projects:
@@ -46,50 +50,163 @@ def _model_paths(root: Path, files: set[str], base: str) -> tuple[list[PurePosix
                               for name in files for i, part in enumerate(PurePosixPath(name).parts[:-1])
                               if part == "models"})
         manifests.append(root / "target/manifest.json")
-    return directories, manifests
+        upstream = sorted({PurePosixPath(*PurePosixPath(name).parts[:i + 1])
+                           for name in files for i, part in enumerate(PurePosixPath(name).parts[:-1])
+                           if part in ("seeds", "snapshots")})
+    return directories, manifests, upstream
 
 
-def _manifest_names(root: Path, manifests: list[Path]) -> dict[str, list[str]]:
-    names = {}
+def _identifiers(name: str, alias: str | None = None, schema: str | None = None) -> list[str]:
+    names = [value for value in (alias, name) if value]
+    return ([f"{schema}.{alias or name}"] if schema else []) + names
+
+
+def _manifest_names(root: Path, manifests: list[Path], warnings: list[str]) -> tuple[dict[str, list[str]], set[str]]:
+    names, external = {}, set()
     for path in manifests:
         if not path.is_file():
             continue
-        manifest = json.loads(path.read_text())
+        try:
+            manifest = json.loads(path.read_text())
+            if not isinstance(manifest, dict) or not all(isinstance(manifest.get(key, {}), dict) for key in ("nodes", "sources", "metadata")):
+                raise ValueError("invalid manifest structure")
+        except (OSError, ValueError) as exc:
+            warnings.append(f"Cannot read {path.relative_to(root)}; falling back to project files: {exc}")
+            continue
         # target-path can be customized, so locate the project from its config.
         project = next((parent for parent in path.parents if (parent / "dbt_project.yml").is_file()), root)
-        for node in manifest.get("nodes", {}).values():
-            if node.get("resource_type") != "model" or not node.get("original_file_path"):
+        for node in list(manifest.get("nodes", {}).values()) + list(manifest.get("sources", {}).values()):
+            if not isinstance(node, dict) or not node.get("name"):
                 continue
             project_name = manifest.get("metadata", {}).get("project_name")
             if project_name and node.get("package_name", project_name) != project_name:
+                continue
+            if node.get("resource_type") in ("source", "seed", "snapshot"):
+                external.update(_identifiers(node["name"], node.get("identifier") or node.get("alias"), node.get("schema")))
+            if node.get("resource_type") != "model" or not node.get("original_file_path"):
                 continue
             source = (project / node["original_file_path"]).relative_to(root).as_posix()
             alias = node.get("alias") or node["name"]
             names.setdefault(source, []).extend([
                 f"{node.get('schema')}.{alias}", alias, node["name"],
             ])
-    return names
+    return names, external
 
 
-def compare_sources(root: Path, current: dict, revision: str | None = None) -> dict:
-    """Compare merge-base to working tree, plus non-ignored untracked models."""
+def _project_names(root: Path, files: set[str], base: str, warnings: list[str],
+                   changed_baseline: set[str]) -> tuple[set[str], dict[str, list[str]]]:
+    """Read declarations without compiling dbt or querying a database."""
+    names, aliases = set(), {}
+    for name in sorted(files):
+        path = PurePosixPath(name)
+        if path.suffix not in (".yml", ".yaml") or path.name == "dbt_project.yml":
+            continue
+        source = root / name
+        try:
+            texts = [source.read_text()] if source.is_file() else [_git(root, "show", f"{base}:{name}")]
+            if source.is_file() and name in changed_baseline:
+                texts.append(_git(root, "show", f"{base}:{name}"))
+        except (OSError, ValueError, yaml.YAMLError):
+            warnings.append(f"Cannot read declarations in {name}; falling back to file names")
+            continue
+        for text in texts:
+            try:
+                data = yaml.safe_load(text) or {}
+            except yaml.YAMLError:
+                warnings.append(f"Cannot read declarations in {name}; falling back to file names")
+                continue
+            if not isinstance(data, dict):
+                continue
+            for kind in ("models", "seeds", "snapshots"):
+                for item in data.get(kind, []) or []:
+                    if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                        continue
+                    config = item.get("config") or {}
+                    if not isinstance(config, dict):
+                        config = {}
+                    identifiers = _identifiers(item["name"], config.get("alias"), config.get("schema"))
+                    names.update(identifiers)
+                    if kind == "models":
+                        aliases.setdefault(item["name"], []).extend(identifiers)
+            for item in data.get("sources", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                for table in item.get("tables", []) or []:
+                    if isinstance(table, dict) and isinstance(table.get("name"), str):
+                        names.update(_identifiers(table["name"], table.get("identifier"), item.get("schema") or item.get("name")))
+    return names, aliases
+
+
+def _inline_names(text: str, stem: str) -> list[str]:
+    """Recognize literal Jinja config names; never execute project code."""
+    config = re.search(r"\{\{\s*config\s*\((.*?)\)\s*\}\}", text, re.DOTALL)
+    if not config:
+        return []
+    values = {match[0]: match[2] for match in re.findall(r"\b(alias|schema)\s*=\s*(['\"])(.*?)\2", config[1])}
+    return _identifiers(stem, values.get("alias"), values.get("schema"))
+
+
+def _external_table(table: dict) -> bool:
+    """Do not infer a missing upstream source/seed as a new transformation."""
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", table["name"] + " " + table.get("group", ""))
+    tokens = set(re.split(r"[^a-z0-9]+", text.lower()))
+    return bool(tokens & {"source", "sources", "src", "raw", "seed", "seeds", "snapshot", "snapshots", "external", "landing", "reference"})
+
+
+def _design_baseline(root: Path, base: str, files: set[str], dbml_path: Path | None,
+                     baseline_dbml: Path | None) -> tuple[dict | None, str | None]:
+    if baseline_dbml is not None:
+        return parse_dbml(baseline_dbml), str(baseline_dbml)
+    if dbml_path is not None:
+        try:
+            relative = dbml_path.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            return None, None
+        if relative in files:
+            return parse_dbml_text(_git(root, "show", f"{base}:{relative}")), f"{base[:8]}:{relative}"
+    return None, None
+
+
+def compare_sources(root: Path, current: dict, revision: str | None = None, *,
+                    dbml_path: Path | None = None, baseline_dbml: Path | None = None) -> dict:
+    """Combine branch source changes, project name inventory, and design changes."""
     try:
         revision = comparison_revision(root, revision)
         target = _git(root, "rev-parse", "--verify", "--end-of-options", revision + "^{commit}")
         base = _git(root, "merge-base", "HEAD", target)
         baseline = _files(root, "ls-tree", "-r", "--name-only", "-z", base)
         working = _files(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
-        directories, manifests = _model_paths(root, baseline | working, base)
-        aliases = _manifest_names(root, manifests)
+        tokens = _git(root, "diff", "--no-ext-diff", "--no-renames", "--name-status", "-z", base, "--", strip=False).split("\0")
+        file_changes = {name: status for status, name in zip(tokens[::2], tokens[1::2]) if name}
+        directories, manifests, upstream = _model_paths(root, baseline | working, base)
+        warnings = []
+        aliases, external_names = _manifest_names(root, manifests, warnings)
+        declared_names, declared_aliases = _project_names(root, baseline | working, base, warnings, baseline & file_changes.keys())
+        known_names = external_names | declared_names
+        known_names.update(PurePosixPath(name).stem for name in baseline | working
+                           if PurePosixPath(name).suffix in (".csv", ".sql", ".py")
+                           and any(PurePosixPath(name).is_relative_to(directory) for directory in upstream))
 
         def is_model(name):
             path = PurePosixPath(name)
             return path.suffix in (".sql", ".py") and any(path.is_relative_to(directory) for directory in directories)
 
+        # Inventory unchanged models as well as changed ones. A missing build or
+        # manifest must not hide new design models or existing literal aliases.
+        for name in sorted(baseline | working):
+            if not is_model(name):
+                continue
+            stem = PurePosixPath(name).stem
+            source = root / name
+            text = source.read_text() if source.is_file() else _git(root, "show", f"{base}:{name}") if name in baseline else ""
+            aliases[name] = _inline_names(text, stem) + declared_aliases.get(stem, []) + aliases.get(name, []) + [stem]
+            if source.is_file() and name in baseline and name in file_changes:
+                aliases[name].extend(_inline_names(_git(root, "show", f"{base}:{name}"), stem))
+            known_names.update(aliases[name])
+
         # Disable rename inference: file renames are removals/additions, and moves
         # preserving a model name are combined below into one modified model.
-        tokens = _git(root, "diff", "--no-ext-diff", "--no-renames", "--name-status", "-z", base, "--", strip=False).split("\0")
-        changed = {name: status for status, name in zip(tokens[::2], tokens[1::2]) if name and is_model(name)}
+        changed = {name: status for name, status in file_changes.items() if is_model(name)}
         for name in working - baseline:
             if is_model(name) and (root / name).is_file():
                 changed[name] = "A"
@@ -101,7 +218,10 @@ def compare_sources(root: Path, current: dict, revision: str | None = None) -> d
             for candidate in candidates:
                 if candidate in table_names:
                     return candidate
-            matches = {table for table in table_names if table.rsplit(".", 1)[-1] in candidates}
+            folded = {candidate.casefold() for candidate in candidates}
+            matches = {table for table in table_names if table.casefold() in folded}
+            if not matches:
+                matches = {table for table in table_names if table.rsplit(".", 1)[-1].casefold() in folded}
             return next(iter(matches)) if len(matches) == 1 else None
 
         # Do not mark a card when several live sources could own it.
@@ -129,9 +249,38 @@ def compare_sources(root: Path, current: dict, revision: str | None = None) -> d
             if table in unmapped:
                 details.append("No unique diagram card matched this model source")
             entries[table] = {"status": status, "details": details}
+
+        design_before, design_label = _design_baseline(root, base, baseline, dbml_path, baseline_dbml)
+        if design_before is not None:
+            for table, design_change in compare_models(design_before, current)["tables"].items():
+                entry = entries.setdefault(table, {"status": "unchanged", "details": []})
+                if design_change["status"] == "unchanged":
+                    continue
+                if entry["status"] == "unchanged":
+                    entry["status"] = design_change["status"]
+                entry["details"].extend("DBML design: " + detail for detail in design_change["details"])
+
+        # Only infer proposed models when an actual model project was found.
+        # Ambiguous names remain known, so name matching never turns them new.
+        has_project = bool(directories) or any(PurePosixPath(name).name == "dbt_project.yml" for name in baseline | working)
+        if design_before is None and has_project:
+            known_full = {item.casefold() for item in known_names}
+            known_short = {item.rsplit(".", 1)[-1] for item in known_full}
+            for table in current["tables"]:
+                name = table["name"]
+                if entries[name]["status"] != "unchanged" or _external_table(table):
+                    continue
+                if name.casefold() in known_full or name.rsplit(".", 1)[-1].casefold() in known_short:
+                    continue
+                entries[name] = {"status": "new", "details": [
+                    "Proposed model: no matching model file, alias, or declaration found in the project or branch baseline",
+                    "New status inferred from project names; no implementation or database build is required",
+                ]}
         counts = {status: sum(entry["status"] == status for entry in entries.values())
                   for status in ("new", "modified", "removed", "unchanged")}
         return {"tables": entries, "counts": counts, "revision": revision, "base": base[:8],
-                "includes_local_edits": True, "mode": "sources", "unmapped": unmapped}
+                "includes_local_edits": True, "mode": "hybrid", "unmapped": unmapped,
+                "design_baseline": design_label, "design_baseline_missing": design_before is None and has_project,
+                "warnings": warnings}
     except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
         raise ValueError(f"Cannot compare model sources with {revision or 'main'!r}: {exc}") from exc

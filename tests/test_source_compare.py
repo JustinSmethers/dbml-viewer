@@ -27,7 +27,7 @@ class SourceComparisonTests(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-m", "baseline")
         self.git("switch", "-c", "feature")
-        self.data = parse_dbml_text("Table users {\n id int\n}\nTable orders {\n id int\n}")
+        self.data = parse_dbml_text("Table users {\n id int\n}")
 
     def git(self, *args):
         return subprocess.run(["git", "-C", str(self.root), *args], check=True,
@@ -47,11 +47,12 @@ class SourceComparisonTests(unittest.TestCase):
         self.write("generated.dbml", "Table users {\n id int\n}")
         changes = self.compare()
         self.assertEqual(changes["revision"], "main")
-        self.assertEqual(changes["counts"], {"new": 0, "modified": 1, "removed": 0, "unchanged": 1})
+        self.assertEqual(changes["counts"], {"new": 0, "modified": 1, "removed": 0, "unchanged": 0})
         self.assertEqual(changes["tables"]["users"]["details"], ["Modified model source: models/users.sql"])
-        self.assertIn("Model source changes", render_html(dict(self.data, comparison=changes)))
+        self.assertIn("Model and design changes", render_html(dict(self.data, comparison=changes)))
 
     def test_new_staged_unstaged_and_untracked_models(self):
+        self.data = parse_dbml_text("Table users {\n id int\n}\nTable orders {\n id int\n}")
         self.write("models/users.sql", "select 2 as id\n")
         self.git("add", "models/users.sql")
         self.write("models/users.sql", "select 3 as id\n")
@@ -119,6 +120,7 @@ class SourceComparisonTests(unittest.TestCase):
         self.assertEqual(self.compare()["counts"]["modified"], 0)
 
     def test_custom_paths_python_models_and_spaces(self):
+        self.data = parse_dbml_text("Table users {\n id int\n}\nTable orders {\n id int\n}")
         self.write("dbt_project.yml", 'name: demo\nmodel-paths: ["custom models"]\n')
         self.write("custom models/orders.py", "def model(dbt, session): pass\n")
         self.write("models/users.sql", "select 2 as id\n")
@@ -167,6 +169,7 @@ class SourceComparisonTests(unittest.TestCase):
         self.assertEqual(set(changes["unmapped"]), {"models/users.sql", "models/other/users.sql"})
 
     def test_nested_project_config_and_manifest(self):
+        self.data = parse_dbml_text("Table users {\n id int\n}\nTable orders {\n id int\n}")
         self.write("dbt/target/manifest.json", json.dumps({"nodes": {
             "model.nested.orders": {"resource_type": "model", "name": "renamed", "alias": "orders",
                                     "schema": "public", "original_file_path": "transform/renamed.sql"},
@@ -188,7 +191,7 @@ class SourceComparisonTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         output = path.with_name("generated_diagram.html")
         self.assertIn("Modified model source: models/users.sql", output.read_text())
-        self.assertIn("Model source changes", output.read_text())
+        self.assertIn("Model and design changes", output.read_text())
         result = self.cli(path, "--no-compare")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('id="branch-toggle"', output.read_text())
@@ -211,6 +214,118 @@ class SourceComparisonTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             result = self.cli(path, "--compare", "missing")
             self.assertNotEqual(result.returncode, 0)
+
+    def test_design_only_new_model_needs_no_sql_or_build(self):
+        self.data = parse_dbml_text("Table users {\n id int\n}\nTable planned_orders {\n id int\n}")
+        changes = self.compare()
+        self.assertEqual(changes["tables"]["users"]["status"], "unchanged")
+        self.assertEqual(changes["tables"]["planned_orders"]["status"], "new")
+        self.assertIn("Proposed model", changes["tables"]["planned_orders"]["details"][0])
+        self.assertTrue(changes["design_baseline_missing"])
+
+    def test_existing_source_name_matches_case_insensitively(self):
+        self.data = parse_dbml_text("Table analytics.USERS {\n id int\n}")
+        self.assertEqual(self.compare()["tables"]["analytics.USERS"]["status"], "unchanged")
+        self.write("models/users.sql", "select 2 as id\n")
+        self.assertEqual(self.compare()["tables"]["analytics.USERS"]["status"], "modified")
+
+    def test_no_manifest_literal_alias_and_yaml_declarations(self):
+        self.write("models/users.sql", "{{ config(alias='customers') }}\nselect 1 as id\n")
+        self.write("models/schema.yml", """models:
+  - name: users
+    config:
+      alias: customers
+sources:
+  - name: crm
+    schema: landing_crm
+    tables:
+      - name: events
+        identifier: click_events
+""")
+        self.write("seeds/countries.csv", "id\n1\n")
+        self.write("snapshots/history.sql", "select 1 as id\n")
+        self.data = parse_dbml_text("Table customers {\n id int\n}\nTable landing_crm.click_events {\n id int\n}\nTable countries {\n id int\n}\nTable history {\n id int\n}\nTable src_external {\n id int\n}")
+        changes = self.compare()
+        self.assertEqual(changes["counts"]["new"], 0)
+        self.assertEqual(changes["tables"]["customers"]["status"], "modified")
+
+    def test_broken_manifest_falls_back_to_files(self):
+        self.write("models/users.sql", "select 2 as id\n")
+        for contents in ("broken JSON", "[]"):
+            self.write("target/manifest.json", contents)
+            changes = self.compare()
+            self.assertEqual(changes["tables"]["users"]["status"], "modified")
+            self.assertEqual(changes["counts"]["new"], 0)
+            self.assertIn("falling back to project files", changes["warnings"][0])
+
+    def test_baseline_aliases_are_preserved_without_manifest(self):
+        self.git("switch", "main")
+        self.write("models/users.sql", "{{ config(alias='customers') }}\nselect 1 as id\n")
+        self.write("models/schema.yml", "sources:\n  - name: crm\n    tables:\n      - name: events\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "original aliases")
+        self.git("switch", "feature")
+        self.git("merge", "--ff-only", "main")
+        self.write("models/users.sql", "{{ config(alias='accounts') }}\nselect 1 as id\n")
+        self.write("models/schema.yml", "sources:\n  - name: crm\n    tables:\n      - name: renamed_events\n")
+        self.data = parse_dbml_text("Table customers {\n id int\n}\nTable crm.events {\n id int\n}")
+        changes = self.compare()
+        self.assertEqual(changes["tables"]["customers"]["status"], "modified")
+        self.assertEqual(changes["counts"]["new"], 0)
+
+    def test_unimplemented_existing_design_changes_need_baseline(self):
+        self.write("before.dbml", "Table users {\n id int\n}\nTable planned {\n id int\n}\nTable retired {\n id int\n}")
+        self.data = parse_dbml_text("Table users {\n id bigint\n}\nTable planned {\n id int\n description varchar\n}\nTable next {\n id int\n}")
+        changes = compare_sources(self.root, self.data, baseline_dbml=self.root / "before.dbml")
+        self.assertEqual(changes["counts"], {"new": 1, "modified": 2, "removed": 1, "unchanged": 0})
+        self.assertFalse(changes["design_baseline_missing"])
+        self.assertIn("DBML design: Changed type: id: int → bigint", changes["tables"]["users"]["details"])
+        self.assertEqual(changes["tables"]["planned"]["status"], "modified")
+        self.assertEqual(changes["tables"]["retired"]["status"], "removed")
+
+    def test_unchanged_design_only_model_is_not_inferred_new_with_baseline(self):
+        self.write("before.dbml", "Table planned {\n id int\n}")
+        self.data = parse_dbml_text("Table planned {\n id int\n}")
+        changes = compare_sources(self.root, self.data, baseline_dbml=self.root / "before.dbml")
+        self.assertEqual(changes["tables"]["planned"]["status"], "unchanged")
+
+    def test_tracked_design_baseline_is_used_automatically(self):
+        path = self.root / "design.dbml"
+        self.git("switch", "main")
+        self.write("design.dbml", "Table users {\n id int\n}\nTable planned {\n id int\n}")
+        self.git("add", "-f", "design.dbml")
+        self.git("commit", "-m", "original design")
+        self.git("switch", "feature")
+        self.git("merge", "--ff-only", "main")
+        self.write("design.dbml", "Table users {\n id bigint\n}\nTable planned {\n id int\n}\nTable next {\n id int\n}")
+        result = self.cli(path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        html = path.with_name("design_diagram.html").read_text()
+        self.assertIn("DBML design: Changed type: id: int", html)
+        self.assertIn("Design baseline:", html)
+        self.assertNotIn("No earlier DBML:", html)
+
+    def test_source_and_schema_changes_are_combined(self):
+        self.write("before.dbml", "Table users {\n id int\n}")
+        self.write("models/users.sql", "select 2 as id\n")
+        self.data = parse_dbml_text("Table users {\n id bigint\n}")
+        changes = compare_sources(self.root, self.data, baseline_dbml=self.root / "before.dbml")
+        self.assertEqual(changes["counts"]["modified"], 1)
+        details = changes["tables"]["users"]["details"]
+        self.assertEqual(len(details), 2)
+        self.assertTrue(details[0].startswith("Modified model source:"))
+        self.assertTrue(details[1].startswith("DBML design:"))
+
+    def test_cli_baseline_for_ignored_dbml_and_missing_baseline_error(self):
+        self.write("before.dbml", "Table users {\n id int\n}")
+        self.write("design.dbml", "Table users {\n id bigint\n}")
+        path = self.root / "design.dbml"
+        result = self.cli(path, "--baseline-dbml", self.root / "before.dbml")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DBML design: Changed type", path.with_name("design_diagram.html").read_text())
+        result = self.cli(path, "--baseline-dbml", self.root / "missing.dbml")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

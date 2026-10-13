@@ -52,6 +52,9 @@ dbml-viewer model.dbml --no-compare
 
 # Explicitly compare the DBML schema instead of model source files
 dbml-viewer model.dbml --compare-dbml main
+
+# Include design-only edits when the DBML isn't tracked in Git
+dbml-viewer design.dbml --baseline-dbml before.dbml
 ```
 
 ### Options
@@ -66,12 +69,19 @@ dbml-viewer model.dbml --compare-dbml main
 | `--no-compare` | Disable branch change highlighting | Off |
 | `--compare-dbml REF` | Compare the DBML schema itself with its Git snapshot at the merge base | Off |
 | `--project-dir PATH` | Select the model Git checkout when the generated DBML is elsewhere | Input file's repository, then current directory |
+| `--baseline-dbml PATH` | Earlier DBML design for detecting changes before implementation | Same input path at the Git merge base, if tracked |
 
 ### Reviewing branch changes
 
-Branch highlighting is automatic. The viewer fetches `origin/main` and compares SQL and Python model source files with its common ancestor with `HEAD`. This avoids stale local `main` branches. It includes committed branch changes, staged and unstaged edits, and non-ignored untracked model files. Logic-only changes highlight a model even when its columns and relationships are unchanged. The generated DBML does not need to be committed or present on `main`.
+Branch highlighting is automatic and combines code changes with pipeline design changes. The viewer fetches `origin/main` and compares SQL and Python model source files with its common ancestor with `HEAD`. This avoids stale local `main` branches. It includes committed branch changes, staged and unstaged edits, and non-ignored untracked model files. Logic-only changes highlight a model even when its columns and relationships are unchanged.
 
-For dbt projects, the viewer reads `model-paths` from `dbt_project.yml`; otherwise it looks under directories named `models`. It uses a local `target/manifest.json` (or the project's configured `target-path`) to match aliases and schema-qualified names, falling back to unique model filename matches. Changed sources with missing or ambiguous cards are still listed in **Review** with their paths. Macros, tests, model YAML, seeds, and snapshots do not mark models as edited, and indirect downstream impact is not inferred. Regenerate the DBML/manifest when new models or aliases need to appear in the diagram.
+For dbt projects, the viewer reads `model-paths` from `dbt_project.yml`; otherwise it looks under directories named `models`. It matches diagram names using a local manifest, literal SQL `config(alias=...)` values, YAML declarations, and model filenames. Unique matches also allow case differences and schema qualification. A missing or unreadable manifest falls back to project files, so no dbt build or database connection is needed. Changed sources with missing or ambiguous cards are still listed in **Review** with their paths.
+
+When no earlier DBML is available, a diagram model absent from the project name inventory is highlighted as **new**, with a review detail explaining that it is a proposed model without an implementation. Existing source/seed/snapshot declarations and files, upstream layer names, and ambiguous matches are excluded from this inference. Names and aliases found in the branch baseline are also considered. This is a name-based inference: undeclared or computed aliases can still need a DBML baseline to avoid incorrect matches.
+
+To detect **modified models before changing their SQL**, the viewer also compares the DBML design with its merge-base snapshot when that same DBML path is tracked. For generated or ignored DBML, save an earlier export before making design edits and pass it with `--baseline-dbml before.dbml`. Neither DBML file needs to be tracked or built. Column, constraint, note, group, enum, index, and relationship differences are merged with source changes; additions and removals are reviewable too. An unchanged model in the earlier design stays unchanged even if its SQL does not exist yet. Without an earlier design, names alone cannot detect schema edits to an existing model; the CLI and diagram state this limitation.
+
+Macros, tests, model YAML, seeds, and snapshots do not mark models as edited solely from their file diffs, and indirect downstream impact is not inferred. YAML, seeds, and snapshots are used to recognize existing project names.
 
 Use `--compare REF` to choose another baseline, `--no-compare` to disable the overlay, or `--project-dir /path/to/project` when the generated DBML is outside your model repository and you are running elsewhere. Both `--compare main` and `--compare origin/main` refresh and use `origin/main` when an origin remote is configured. Other comparison refs must exist locally. Fetching updates the remote tracking ref without switching branches or moving local `main`. If the fetch fails, the viewer reports that comparison is unavailable and generates the diagram without highlighting; explicitly requested comparisons exit with an error. It never silently falls back to a stale local main after a failed fetch. Repositories without an origin remote can use local `main` (or an existing `origin/main`). Renaming a model source appears as removal/addition; moving a file while preserving a uniquely matched model name appears as a modification.
 

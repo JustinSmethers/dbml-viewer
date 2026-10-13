@@ -33,18 +33,15 @@ def main():
         (root / "models").mkdir()
         for table in parse_dbml(path)["tables"]:
             (root / "models" / (table["name"] + ".sql")).write_text("select 1 as id\n")
-        (root / ".gitignore").write_text("*.dbml\n")
         git("add", ".")
         git("commit", "-m", "Sample baseline")
         git("switch", "-c", "feature/customer-segments")
         current = original.replace("lifetime_value decimal", "lifetime_value decimal(18,2)\n  customer_segment varchar")
         current += '\nTable fct_customer_segments {\n customer_id int [pk]\n segment varchar\n score decimal\n}\nRef: fct_customer_segments.customer_id > marts_customers.customer_id\n'
         path.write_text(current)
-        (root / "models/marts_customers.sql").write_text("select 2 as id\n")
-        (root / "models/fct_customer_segments.sql").write_text("select 1 as customer_id, 'new' as segment\n")
-        (root / "models/legacy_report.sql").unlink()
+        # Design changes precede implementation: model SQL is left as it was.
         data = parse_dbml(path)
-        data["comparison"] = compare_sources(root, data)
+        data["comparison"] = compare_sources(root, data, dbml_path=path)
         output = ROOT / "examples/branch-changes.html"
         output.write_text(render_html(data))
         print(f"Preview: {output}")
