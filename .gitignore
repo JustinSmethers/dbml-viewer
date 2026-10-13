@@ -12,3 +12,7 @@ wheels/
 # Generated visual review artifacts
 examples/*.html
 examples/*-review.jpg
+
+# Local data model and generated diagram (keep out of repository history)
+/new.dbml
+/new_diagram.html

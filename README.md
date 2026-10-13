@@ -40,6 +40,9 @@ dbml-viewer examples/layered.dbml
 
 # Generate without opening browser
 dbml-viewer model.dbml --no-open
+
+# Highlight this branch's DBML changes, including local edits
+dbml-viewer model.dbml --compare main
 ```
 
 ### Options
@@ -50,6 +53,26 @@ dbml-viewer model.dbml --no-open
 | `-o`, `--output` | Output HTML file path | `<input>_diagram.html` |
 | `--layout` | Layout direction: `TB` (top-to-bottom) or `LR` (left-to-right) | `LR` |
 | `--no-open` | Skip auto-opening the browser | Off |
+| `--compare REF` | Compare the input with its Git snapshot at the merge base of `HEAD` and `REF` | Off |
+
+### Reviewing branch changes
+
+Use `--compare main` (or `--compare origin/main`) inside a Git checkout. The viewer compares the current on-disk DBML, including uncommitted edits, with the same path at the branches' common ancestor. The chosen ref must exist locally; fetch it yourself if needed. A file absent at the baseline is treated as new. Renamed models or DBML files appear as removals/additions or an all-new file; renames are not inferred.
+
+The **Highlight changes** toggle adds green outlines and `+ NEW` badges to new models, and amber outlines and `~ EDITED` badges to modified models. Layer colors stay visible. Unchanged models fade slightly. **Focus changes** zooms to changed models and their immediate relationship neighbors, fading unrelated cards and joins. Toggling highlighting preserves table positions.
+
+Click a card's badge or **Review** to inspect its changes and emphasize that model and its immediate neighbors. **Previous** and **Next** cycle through changed models, including removals. Removed models appear in the review panel and counts; they do not occupy ghost cards in the diagram. Escape closes the panel and clears a pinned join.
+
+Comparison ignores comments, whitespace, declaration order and equivalent `<`/`>` ref spelling. It detects added/removed columns, types, key/null/unique/increment/default constraints, notes, indexes, groups, group colors, enums used by columns, and declared relationships. A relationship change marks both endpoint models as modified. This reflects the schema represented in DBML; SQL-only changes and undeclared relationships are not detected. Changes are captured when HTML is generated; regenerate to refresh them.
+
+For a demo with one new, one modified and one removed model:
+
+```bash
+uv run python examples/preview_changes.py
+# Open examples/branch-changes.html
+```
+
+The demo creates a disposable Git repository and leaves your checkout untouched.
 
 ## Interacting with the Diagram
 

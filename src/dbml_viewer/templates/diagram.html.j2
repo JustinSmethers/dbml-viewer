@@ -222,6 +222,49 @@
   .join-detail button { position: absolute; right: 10px; top: 10px; background: none; color: #cbd5e1; border: 0; cursor: pointer; font-size: 18px; }
   .empty-message { color: #94a3b8; padding: 120px 32px; text-align: center; }
 
+  /* Branch status is separate from warehouse layer colors. */
+  .branch-toolbar { margin-top: 12px; border-top: 1px solid #334155; padding-top: 12px; }
+  .branch-baseline { font-size: 11px; color: #cbd5e1; overflow-wrap: anywhere; }
+  .branch-baseline small { display: block; color: #94a3b8; font-size: 10px; margin-top: 4px; }
+  .branch-counts { display: flex; gap: 12px; margin: 10px 0; font-size: 11px; }
+  .status-new { color: #86efac; }
+  .status-modified { color: #fcd34d; }
+  .status-removed { color: #fda4af; }
+  .branch-actions { display: flex; gap: 6px; }
+  .branch-btn { border: 1px solid #475569; background: #1e293b; color: #e2e8f0; padding: 7px 9px; border-radius: 6px; font-size: 11px; cursor: pointer; }
+  .branch-btn:hover { background: #334155; }
+  .branch-btn[aria-pressed="true"] { background: #24433d; border-color: #5f9e8e; }
+  .branch-btn:disabled { opacity: 0.4; cursor: default; }
+  button:focus-visible { outline: 2px solid #7dd3fc; outline-offset: 3px; }
+  .change-badge { margin-left: 10px; border: 0; border-radius: 4px; padding: 3px 6px; font-size: 9px; font-weight: 800; letter-spacing: 0.4px; cursor: pointer; white-space: nowrap; flex-shrink: 0; }
+  .change-badge.new { background: #dcfce7; color: #166534; }
+  .change-badge.modified { background: #fef3c7; color: #854d0e; }
+  .diagram-canvas:not(.branch-overlay) .change-badge { visibility: hidden; }
+  .branch-overlay .table-node.change-new { outline: 2px solid #4ade80; outline-offset: 3px; }
+  .branch-overlay .table-node.change-modified { outline: 2px solid #fbbf24; outline-offset: 3px; }
+  .branch-overlay .table-node.branch-muted { opacity: 0.6; }
+  .branch-overlay .edge.branch-muted { opacity: 0.24; }
+  .branch-overlay .table-node.branch-outside { opacity: 0.16; }
+  .branch-overlay .edge.branch-outside { opacity: 0.06; }
+  .branch-overlay .group-bg.branch-outside { opacity: 0.25; }
+  .branch-overlay .table-node.dimmed { opacity: 0.18; }
+  .branch-overlay .edge.dimmed { opacity: 0.08; }
+  .branch-overlay .table-node.change-selected { outline-width: 4px; }
+  .change-detail { position: fixed; top: 206px; left: 16px; width: 340px; max-height: calc(100vh - 390px); overflow: auto; z-index: 110; background: rgba(23,35,53,0.98); color: #e2e8f0; border: 1px solid #475569; border-radius: 10px; padding: 16px; font-size: 12px; }
+  .change-detail[hidden] { display: none; }
+  .change-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .change-heading span { font-size: 10px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.6px; }
+  .change-heading button { background: none; border: 0; color: #cbd5e1; font-size: 20px; cursor: pointer; }
+  .change-detail h2 { font-size: 13px; overflow-wrap: anywhere; margin-bottom: 8px; }
+  .change-detail ul { margin: 12px 0 16px; padding-left: 17px; line-height: 1.6; overflow-wrap: anywhere; }
+  .change-detail li + li { margin-top: 8px; }
+  .change-nav { display: flex; align-items: center; justify-content: space-between; }
+  .change-nav span { color: #94a3b8; font-size: 11px; }
+  @media (max-width: 900px) {
+    .change-detail { top: auto; bottom: 16px; max-height: 40vh; width: min(340px, calc(100vw - 130px)); }
+    .project-header { max-width: calc(100vw - 130px); }
+  }
+
 
   /* ── Legend panel ────────────────────────────────────────────── */
   .legend {
@@ -319,6 +362,22 @@
 <div class="project-header">
   <div class="project-name">{{ data.project.name or "DBML Diagram" }}</div>
   <div class="project-meta">{{ data.tables | length }} tables &middot; {{ data.refs | length }} relationships &middot; {{ "Left to right" if layout == "LR" else "Top to bottom" }}</div>
+  {% if data.comparison %}
+  <div class="branch-toolbar">
+    <div class="branch-baseline">Changes since <strong>{{ data.comparison.revision }}</strong><small>Merge base {{ data.comparison.base }} · Includes local edits</small></div>
+    <div class="branch-counts">
+      <span class="status-new">+ {{ data.comparison.counts.new }} new</span>
+      <span class="status-modified">~ {{ data.comparison.counts.modified }} modified</span>
+      {% if data.comparison.counts.removed %}<span class="status-removed">− {{ data.comparison.counts.removed }} removed</span>{% endif %}
+    </div>
+    <div class="branch-actions">
+      <button class="branch-btn" id="branch-toggle" aria-pressed="true">Highlight changes</button>
+      <button class="branch-btn" id="branch-focus" aria-pressed="false">Focus changes</button>
+      <button class="branch-btn" id="branch-review">Review</button>
+    </div>
+    {% if not (data.comparison.counts.new + data.comparison.counts.modified + data.comparison.counts.removed) %}<div class="branch-baseline"><small>No model changes.</small></div>{% endif %}
+  </div>
+  {% endif %}
 </div>
 
 <!-- Controls -->
@@ -356,6 +415,15 @@
 </div>
 
 <!-- Diagram -->
+{% if data.comparison %}
+<aside class="change-detail" id="change-detail" aria-label="Model changes" hidden>
+  <div class="change-heading"><span>Model changes</span><button id="close-changes" aria-label="Close model changes">&times;</button></div>
+  <h2 id="change-name"></h2>
+  <div id="change-status"></div>
+  <ul id="change-list"></ul>
+  <div class="change-nav"><button class="branch-btn" id="change-prev" aria-label="Previous changed model">← Previous</button><span id="change-index"></span><button class="branch-btn" id="change-next" aria-label="Next changed model">Next →</button></div>
+</aside>
+{% endif %}
 <div class="diagram-container" id="container">
   <div class="diagram-canvas" id="canvas">
     <svg class="edges-svg" id="edges-svg"></svg>
@@ -397,6 +465,8 @@
   let selectedJoin = null;
   const nodeElements = {};   // tableName -> DOM element
   const nodePositions = {};  // tableName -> { x, y, w, h }
+
+  {% include "branch-changes.js" %}
 
   function getColor(group) {
     return COLORS[group] || stageColors[DBMLLayout.stageName(group)] || COLORS._default;
@@ -485,6 +555,8 @@
       const color = tableColor(table);
       const div = document.createElement('div');
       div.className = 'table-node';
+      const change = comparison?.tables[table.name];
+      if (change) div.classList.add('change-' + change.status);
       div.dataset.table = table.name;
       div.style.left = pos.x + 'px';
       div.style.top = pos.y + 'px';
@@ -493,6 +565,7 @@
         <div class="table-header" style="background:${color.header}"
              data-note="${escapeHtml(table.note)}">
           <span class="table-name">${escapeHtml(table.name)}</span>
+          ${change && ['new', 'modified'].includes(change.status) ? `<button class="change-badge ${change.status}" aria-label="Review changes to ${escapeHtml(table.name)}">${change.status === 'new' ? '+ NEW' : '~ EDITED'}</button>` : ''}
           <span class="toggle-icon">&#x25BC;</span>
         </div>
         <div class="table-columns">
@@ -700,6 +773,7 @@
       });
       edgesSvg.appendChild(group);
     });
+    applyBranchOverlay();
     if (selectedJoin !== null) traceJoin(selectedJoin);
   }
 
@@ -817,6 +891,7 @@
   let mouseDownOnHeader = false;
 
   canvas.addEventListener('mousedown', e => {
+    if (e.target.closest('.change-badge')) { e.stopPropagation(); return; }
     const node = e.target.closest('.table-node');
     if (!node) return;
 
@@ -910,6 +985,7 @@
     });
   }
   function selectJoin(index) {
+    if (index !== null) closeChanges();
     selectedJoin = index;
     traceJoin(index);
     const panel = document.getElementById('join-detail');
@@ -942,7 +1018,7 @@
     e.stopPropagation();
   });
   document.getElementById('clear-join').addEventListener('click', () => selectJoin(null));
-  window.addEventListener('keydown', e => { if (e.key === 'Escape') selectJoin(null); });
+  window.addEventListener('keydown', e => { if (e.key === 'Escape') { selectJoin(null); closeChanges(); } });
 
   // ── Control buttons ───────────────────────────────────────────
   document.getElementById('zoom-in').addEventListener('click', () => {
@@ -996,9 +1072,12 @@
     });
   });
 
-  function fitToScreen() {
+  function fitToScreen(names = null) {
+    // Event handlers pass an Event; only a Set is a requested subset.
+    const subset = names instanceof Set ? names : branchContext();
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     MODEL.tables.forEach(t => {
+      if (subset && !subset.has(t.name)) return;
       const p = nodePositions[t.name];
       if (!p) return;
       minX = Math.min(minX, p.x);
@@ -1010,6 +1089,7 @@
     if (!Number.isFinite(minX)) { scale = 1; tx = 0; ty = 0; applyTransform(); return; }
     // Include group headers in the fitted bounds.
     Object.values(groupElements).forEach(el => {
+      if (subset) return;
       minX = Math.min(minX, el.offsetLeft); minY = Math.min(minY, el.offsetTop);
       maxX = Math.max(maxX, el.offsetLeft + el.offsetWidth); maxY = Math.max(maxY, el.offsetTop + el.offsetHeight);
     });
@@ -1017,15 +1097,28 @@
     const contentH = Math.max(1, maxY - minY);
     const viewW = container.clientWidth;
     const viewH = container.clientHeight;
-    const margin = 80;
+    const panel = document.getElementById('change-detail');
+    const panelOpen = panel && !panel.hidden;
+    const sidebar = panelOpen && viewW > 1200;
+    const left = sidebar ? 390 : 60;
+    const right = 100;
+    let top = comparison ? document.querySelector('.project-header').getBoundingClientRect().bottom + 30 : 90;
+    let bottom = 90;
+    if (panelOpen && !sidebar) {
+      const bounds = panel.getBoundingClientRect();
+      if (viewW > 900) top = Math.max(top, bounds.bottom + 30);
+      else bottom = Math.max(bottom, viewH - bounds.top + 24);
+    }
+    const availableW = Math.max(1, viewW - left - right);
+    const availableH = Math.max(1, viewH - top - bottom);
 
     scale = Math.min(
-      Math.max(1, viewW - margin * 2) / contentW,
-      Math.max(1, viewH - margin * 2 - 40) / contentH,
+      availableW / contentW,
+      availableH / contentH,
       1.5
     );
-    tx = (viewW - contentW * scale) / 2 - minX * scale;
-    ty = (viewH - contentH * scale) / 2 + 20 - minY * scale;
+    tx = left + (availableW - contentW * scale) / 2 - minX * scale;
+    ty = top + (availableH - contentH * scale) / 2 - minY * scale;
     applyTransform();
   }
 
