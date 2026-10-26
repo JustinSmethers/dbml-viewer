@@ -2,7 +2,9 @@
 
 import json
 import re
+import subprocess
 from pathlib import Path, PurePosixPath
+from typing import Callable
 
 import yaml
 
@@ -19,6 +21,21 @@ def find_repository(path: Path, project_dir: Path | None = None) -> Path:
         except (OSError, ValueError):
             pass
     raise ValueError("No Git checkout found; use --project-dir to select the model repository")
+
+
+def find_project(path: Path, project_dir: Path | None = None) -> Path | None:
+    """Nearest directory containing dbt_project.yml, for SQL lineage without Git.
+
+    Walks up from ``project_dir``, then the DBML file's directory, then the
+    current directory; returns None when none of them is inside a dbt project.
+    """
+    starts = ([project_dir] if project_dir else []) + [path.resolve().parent, Path.cwd()]
+    for start in starts:
+        start = Path(start).resolve()
+        for candidate in (start, *start.parents):
+            if (candidate / "dbt_project.yml").is_file():
+                return candidate
+    return None
 
 
 def _files(root: Path, *args: str) -> set[str]:
@@ -58,9 +75,87 @@ def _model_paths(root: Path, files: set[str], base: str) -> tuple[list[PurePosix
     return directories, manifests, upstream, seeds
 
 
+def project_paths(root: Path) -> tuple[list[str], list[str]]:
+    """Model directories and manifest paths from working-tree dbt_project.yml files.
+
+    Used for lineage when no branch comparison ran. Needs no Git history (or
+    no Git at all); defaults to ``models`` and ``target/manifest.json``.
+    """
+    try:
+        files = _files(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    except (OSError, ValueError):
+        # Not a Git checkout (see find_project): read the root's own dbt_project.yml.
+        files = {"dbt_project.yml"} if (root / "dbt_project.yml").is_file() else set()
+    directories, manifests = [], []
+    for name in sorted(name for name in files if PurePosixPath(name).name == "dbt_project.yml"):
+        try:
+            config = yaml.safe_load((root / name).read_text()) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(config, dict):
+            continue
+        parent = PurePosixPath(name).parent
+        directories.extend((parent / directory).as_posix() for directory in config.get("model-paths", ["models"]))
+        manifests.append((parent / config.get("target-path", "target") / "manifest.json").as_posix())
+    return (list(dict.fromkeys(directories)) or ["models"]), (list(dict.fromkeys(manifests)) or ["target/manifest.json"])
+
+
+DIFF_LINES = 300
+
+
+def source_diff(root: Path, base: str, name: str, untracked: bool = False) -> str | None:
+    """Unified diff of one source file against ``base`` (None for binary or empty diffs).
+
+    Untracked files are diffed against /dev/null, where exit code 1 means
+    "differences found". Long diffs keep the first DIFF_LINES lines.
+    """
+    args = (["diff", "--no-ext-diff", "--no-color", "--no-index", "--", "/dev/null", name] if untracked
+            else ["diff", "--no-ext-diff", "--no-color", base, "--", name])
+    try:
+        result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
+                                errors="replace", timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode not in ((0, 1) if untracked else (0,)) or not result.stdout.strip():
+        return None
+    lines = result.stdout.splitlines()
+    if any(line.startswith(("Binary files ", "GIT binary patch")) for line in lines):
+        return None
+    if len(lines) > DIFF_LINES:
+        lines = lines[:DIFF_LINES] + [f"… ({len(lines) - DIFF_LINES} more lines)"]
+    return "\n".join(lines)
+
+
+def _relative(root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
 def _identifiers(name: str, alias: str | None = None, schema: str | None = None) -> list[str]:
     names = [value for value in (alias, name) if value]
     return ([f"{schema}.{alias or name}"] if schema else []) + names
+
+
+def _read_manifest(path: Path) -> dict:
+    """Load a dbt manifest, raising ValueError when its structure is unusable."""
+    manifest = json.loads(path.read_text())
+    if not isinstance(manifest, dict) or not all(isinstance(manifest.get(key, {}), dict) for key in ("nodes", "sources", "metadata")):
+        raise ValueError("invalid manifest structure")
+    return manifest
+
+
+def _match_table(candidates: list[str], table_names: set[str]) -> str | None:
+    """Map model identifiers to one diagram table: exact, then case-folded, then unqualified."""
+    for candidate in candidates:
+        if candidate in table_names:
+            return candidate
+    folded = {candidate.casefold() for candidate in candidates}
+    matches = {table for table in table_names if table.casefold() in folded}
+    if not matches:
+        matches = {table for table in table_names if table.rsplit(".", 1)[-1].casefold() in folded}
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 def _manifest_names(root: Path, manifests: list[Path], warnings: list[str]) -> tuple[dict[str, list[str]], set[str]]:
@@ -69,9 +164,7 @@ def _manifest_names(root: Path, manifests: list[Path], warnings: list[str]) -> t
         if not path.is_file():
             continue
         try:
-            manifest = json.loads(path.read_text())
-            if not isinstance(manifest, dict) or not all(isinstance(manifest.get(key, {}), dict) for key in ("nodes", "sources", "metadata")):
-                raise ValueError("invalid manifest structure")
+            manifest = _read_manifest(path)
         except (OSError, ValueError) as exc:
             warnings.append(f"Cannot read {path.relative_to(root)}; falling back to project files: {exc}")
             continue
@@ -172,16 +265,21 @@ def _design_baseline(root: Path, base: str, files: set[str], dbml_path: Path | N
 
 
 def compare_sources(root: Path, current: dict, revision: str | None = None, *,
-                    dbml_path: Path | None = None, baseline_dbml: Path | None = None) -> dict:
+                    dbml_path: Path | None = None, baseline_dbml: Path | None = None,
+                    progress: Callable[[str], None] | None = None) -> dict:
     """Combine branch source changes, project name inventory, and design changes."""
+    report = progress or (lambda message: None)
     try:
-        revision = comparison_revision(root, revision)
+        revision = comparison_revision(root, revision, progress=report)
+        report(f"Finding the common ancestor of HEAD and {revision}")
         target = _git(root, "rev-parse", "--verify", "--end-of-options", revision + "^{commit}")
         base = _git(root, "merge-base", "HEAD", target)
+        report("Scanning tracked files, local edits, and untracked files")
         baseline = _files(root, "ls-tree", "-r", "--name-only", "-z", base)
         working = _files(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
         tokens = _git(root, "diff", "--no-ext-diff", "--no-renames", "--name-status", "-z", base, "--", strip=False).split("\0")
         file_changes = {name: status for status, name in zip(tokens[::2], tokens[1::2]) if name}
+        report("Reading dbt configuration, manifests, and YAML declarations")
         directories, manifests, upstream, seeds = _model_paths(root, baseline | working, base)
         warnings = []
         aliases, external_names = _manifest_names(root, manifests, warnings)
@@ -204,6 +302,7 @@ def compare_sources(root: Path, current: dict, revision: str | None = None, *,
 
         # Inventory unchanged models as well as changed ones. A missing build or
         # manifest must not hide new design models or existing literal aliases.
+        report("Reading model and seed names and aliases")
         for name in sorted(baseline | working):
             if not is_resource(name):
                 continue
@@ -224,18 +323,11 @@ def compare_sources(root: Path, current: dict, revision: str | None = None, *,
             if is_resource(name) and (root / name).is_file():
                 changed[name] = "A"
 
+        report(f"Matching source changes to {len(current['tables'])} diagram tables")
         table_names = {table["name"] for table in current["tables"]}
 
         def match(name):
-            candidates = aliases.get(name, []) + [PurePosixPath(name).stem]
-            for candidate in candidates:
-                if candidate in table_names:
-                    return candidate
-            folded = {candidate.casefold() for candidate in candidates}
-            matches = {table for table in table_names if table.casefold() in folded}
-            if not matches:
-                matches = {table for table in table_names if table.rsplit(".", 1)[-1].casefold() in folded}
-            return next(iter(matches)) if len(matches) == 1 else None
+            return _match_table(aliases.get(name, []) + [PurePosixPath(name).stem], table_names)
 
         # Do not mark a card when several live sources could own it.
         owners = {}
@@ -245,12 +337,22 @@ def compare_sources(root: Path, current: dict, revision: str | None = None, *,
                 if table:
                     owners.setdefault(table, set()).add(name)
 
+        report("Reading and parsing the earlier DBML design" + (f" ({baseline_dbml})" if baseline_dbml else " (if available)"))
+        design_before, design_label = _design_baseline(root, base, baseline, dbml_path, baseline_dbml)
+        # Models whose DBML card was removed: a deleted source belongs to that removed entry.
+        removed_tables = ({table["name"] for table in design_before["tables"]} - table_names
+                          if design_before is not None else set())
+
         entries = {name: {"status": "unchanged", "details": []} for name in sorted(table_names)}
         mapped_changes = {}
         unmapped = []
         for name, status in sorted(changed.items()):
             table = match(name)
-            if not table or len(owners.get(table, set())) > 1:
+            if not table and status == "D":
+                table = _match_table(aliases.get(name, []) + [PurePosixPath(name).stem], removed_tables)
+            elif table and len(owners.get(table, set())) > 1:
+                table = None
+            if not table:
                 unmapped.append(name)
                 table = name  # Still reviewable even when absent/ambiguous in DBML.
             mapped_changes.setdefault(table, []).append((name, status))
@@ -259,11 +361,20 @@ def compare_sources(root: Path, current: dict, revision: str | None = None, *,
             status = "new" if statuses == {"A"} else "removed" if statuses == {"D"} else "modified"
             details = [{"A": "Added", "D": "Removed"}.get(kind, "Modified") + f" model source: {name}"
                        for name, kind in changes]
+            entry = {"status": status, "details": details}
             if table in unmapped:
                 details.append("No unique diagram card matched this model source")
-            entries[table] = {"status": status, "details": details}
+                entry["unmapped"] = True  # path-keyed: listed separately, never a walkthrough step
+            diffs = []
+            for name, _ in changes:
+                text = source_diff(root, base, name, untracked=name not in file_changes and name not in baseline)
+                if text is not None:
+                    diffs.append({"path": name, "diff": text})
+            if diffs:
+                entry["diffs"] = diffs
+            entries[table] = entry
 
-        design_before, design_label = _design_baseline(root, base, baseline, dbml_path, baseline_dbml)
+        report("Combining model source and DBML design changes")
         if design_before is not None:
             for table, design_change in compare_models(design_before, current)["tables"].items():
                 entry = entries.setdefault(table, {"status": "unchanged", "details": []})
@@ -272,6 +383,8 @@ def compare_sources(root: Path, current: dict, revision: str | None = None, *,
                 if entry["status"] == "unchanged":
                     entry["status"] = design_change["status"]
                 entry["details"].extend("DBML design: " + detail for detail in design_change["details"])
+                if "baseline" in design_change:
+                    entry.setdefault("baseline", design_change["baseline"])
 
         # Only infer proposed models when an actual model project was found.
         # Ambiguous names remain known, so name matching never turns them new.
@@ -292,8 +405,18 @@ def compare_sources(root: Path, current: dict, revision: str | None = None, *,
         counts = {status: sum(entry["status"] == status for entry in entries.values())
                   for status in ("new", "modified", "removed", "unchanged")}
         return {"tables": entries, "counts": counts, "revision": revision, "base": base[:8],
-                "includes_local_edits": True, "mode": "hybrid", "unmapped": unmapped,
+                # The working tree (committed, staged, unstaged, untracked) vs the merge base.
+                # includes_local_edits is the old name, kept for one release.
+                "working_tree": True, "includes_local_edits": True, "unmapped": unmapped,
+                # Model/seed names and aliases at the merge base, so a charter may replace any of them.
+                "baseline_models": sorted({identifier.rsplit(".", 1)[-1] for name in baseline if is_resource(name)
+                                           for identifier in aliases.get(name, [])}),
+                # Without an earlier DBML design only model sources were compared.
+                "mode": "hybrid" if design_before is not None else "sources",
                 "design_baseline": design_label, "design_baseline_missing": design_before is None and has_project,
-                "warnings": warnings}
+                "warnings": warnings,
+                # Reused by lineage so review findings need not rescan the project.
+                "model_dirs": [directory.as_posix() for directory in dict.fromkeys(directories)],
+                "manifests": [_relative(root, path) for path in dict.fromkeys(manifests)]}
     except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
         raise ValueError(f"Cannot compare model sources with {revision or 'main'!r}: {exc}") from exc

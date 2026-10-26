@@ -10,7 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from dbml_viewer.parser import parse_dbml_text
 from dbml_viewer.renderer import render_html
-from dbml_viewer.source_compare import compare_sources
+from dbml_viewer import review
+from dbml_viewer.source_compare import DIFF_LINES, compare_sources, find_project, project_paths
 
 
 class SourceComparisonTests(unittest.TestCase):
@@ -49,7 +50,9 @@ class SourceComparisonTests(unittest.TestCase):
         self.assertEqual(changes["revision"], "main")
         self.assertEqual(changes["counts"], {"new": 0, "modified": 1, "removed": 0, "unchanged": 0})
         self.assertEqual(changes["tables"]["users"]["details"], ["Modified model source: models/users.sql"])
-        self.assertIn("Model and design changes", render_html(dict(self.data, comparison=changes)))
+        # The generated DBML is ignored, so there is no design baseline: only sources were compared.
+        self.assertEqual(changes["mode"], "sources")
+        self.assertIn("Model source changes", render_html(dict(self.data, comparison=changes)))
 
     def test_new_staged_unstaged_and_untracked_models(self):
         self.data = parse_dbml_text("Table users {\n id int\n}\nTable orders {\n id int\n}")
@@ -147,6 +150,57 @@ class SourceComparisonTests(unittest.TestCase):
         self.assertEqual(changes["unmapped"], ["models/users.sql"])
         self.assertIn("No unique diagram card", changes["tables"]["models/users.sql"]["details"][-1])
 
+    def test_deleted_model_and_removed_card_are_one_entry(self):
+        self.git("switch", "main")
+        self.write("models/marts/finance/rpt_churn_legacy.sql", "select 1 as id\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "legacy report")
+        self.git("switch", "feature")
+        self.git("merge", "--ff-only", "main")
+        (self.root / "models/marts/finance/rpt_churn_legacy.sql").unlink()
+        self.write("before.dbml", "Table users {\n id int\n}\nTable rpt_churn_legacy {\n id int\n}")
+        changes = compare_sources(self.root, self.data, baseline_dbml=self.root / "before.dbml")
+        self.assertEqual(changes["counts"], {"new": 0, "modified": 0, "removed": 1, "unchanged": 1})
+        self.assertEqual(changes["unmapped"], [])
+        entry = changes["tables"]["rpt_churn_legacy"]
+        self.assertEqual(entry["status"], "removed")
+        self.assertNotIn("unmapped", entry)
+        self.assertEqual(entry["details"], ["Removed model source: models/marts/finance/rpt_churn_legacy.sql",
+                                            "DBML design: Removed model from the diagram"])
+        self.assertIn("baseline", entry)
+        self.assertEqual([item["path"] for item in entry["diffs"]], ["models/marts/finance/rpt_churn_legacy.sql"])
+        self.assertIn("-select 1 as id", entry["diffs"][0]["diff"])
+        self.assertIn("rpt_churn_legacy", changes["baseline_models"])
+
+    def test_unmapped_sources_are_flagged_and_never_walkthrough_steps(self):
+        (self.root / "models/users.sql").unlink()
+        self.data = parse_dbml_text("Table orders {\n id int\n}")
+        self.data["comparison"] = changes = self.compare()
+        self.assertTrue(changes["tables"]["models/users.sql"]["unmapped"])
+        self.assertEqual(changes["counts"]["removed"], 1)
+        review.build(self.data, comparison=changes, root=self.root)
+        self.assertNotIn("models/users.sql", self.data["review"]["walkthrough"])
+        self.assertNotIn("models/users.sql", self.data["review"]["tables"])
+
+    def test_changed_sources_carry_capped_unified_diffs(self):
+        self.data = parse_dbml_text("Table users {\n id int\n}\nTable orders {\n id int\n}\nTable codes {\n id int\n}")
+        self.write("models/users.sql", "".join(f"select {i} as id\n" for i in range(DIFF_LINES + 50)))
+        self.write("models/orders.sql", "select 1 as id\n")  # untracked
+        (self.root / "seeds").mkdir()
+        (self.root / "seeds/codes.csv").write_bytes(b"id\0\n\x00\xff\n")  # binary: no diff
+        changes = self.compare()
+        [users] = changes["tables"]["users"]["diffs"]
+        self.assertEqual(users["path"], "models/users.sql")
+        lines = users["diff"].splitlines()
+        self.assertEqual(len(lines), DIFF_LINES + 1)
+        self.assertTrue(lines[0].startswith("diff --git"))
+        self.assertRegex(lines[-1], r"^… \(\d+ more lines\)$")
+        [orders] = changes["tables"]["orders"]["diffs"]
+        self.assertIn("+select 1 as id", orders["diff"])
+        self.assertEqual(changes["tables"]["codes"]["status"], "new")
+        self.assertNotIn("diffs", changes["tables"]["codes"])
+        self.assertTrue(changes["working_tree"])
+
     def test_move_with_same_model_name_is_modified(self):
         self.git("mv", "models/users.sql", "models/renamed.sql")
         # A renamed model is a removed model plus a new model.
@@ -191,13 +245,65 @@ class SourceComparisonTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         output = path.with_name("generated_diagram.html")
         self.assertIn("Modified model source: models/users.sql", output.read_text())
-        self.assertIn("Model and design changes", output.read_text())
+        self.assertIn("Model source changes", output.read_text())
         result = self.cli(path, "--no-compare")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('id="branch-toggle"', output.read_text())
         result = self.cli(path, "--compare-dbml", "main")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("DBML schema changes", output.read_text())
+
+    def test_cli_reads_sql_lineage_without_source_comparison(self):
+        self.write("dbt_project.yml", "name: demo\nmodel-paths: [transform]\n")
+        self.write("transform/orders.sql", "select * from {{ ref('users') }}\n")
+        self.write("generated.dbml", "Table users {\n id int\n}\nTable orders {\n id int\n}")
+        path = self.root / "generated.dbml"
+        for flags in (["--no-compare"], ["--compare-dbml", "main"]):
+            result = self.cli(path, *flags)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Lineage: 1 edge (sql 1,", result.stderr)
+            # --compare-dbml sees both models as new; users then has no upstream (an info hint).
+            self.assertIn("(0 errors, 0 warnings,", result.stderr)
+
+    def test_project_paths_defaults_and_dbt_config(self):
+        self.git("rm", "-q", "--cached", "dbt_project.yml")
+        (self.root / "dbt_project.yml").unlink()
+        self.assertEqual(project_paths(self.root), (["models"], ["target/manifest.json"]))
+        self.write("warehouse/dbt_project.yml", "name: wh\nmodel-paths: [src_models]\ntarget-path: build\n")
+        self.assertEqual(project_paths(self.root), (["warehouse/src_models"], ["warehouse/build/manifest.json"]))
+
+    def test_find_project_walks_up_without_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory).resolve()
+            (project / "dbt_project.yml").write_text("name: plain\nmodel-paths: [transform]\n")
+            (project / "docs/design").mkdir(parents=True)
+            dbml = project / "docs/design/model.dbml"
+            self.assertEqual(find_project(dbml), project)
+            self.assertEqual(find_project(Path("/nonexistent/x.dbml"), project / "docs"), project)
+            self.assertEqual(project_paths(project), (["transform"], ["target/manifest.json"]))
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = os.getcwd()
+            os.chdir(directory)
+            try:
+                self.assertIsNone(find_project(Path(directory) / "x.dbml"))
+            finally:
+                os.chdir(cwd)
+
+    def test_cli_builds_sql_lineage_from_a_dbt_project_without_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory).resolve()
+            (project / "dbt_project.yml").write_text("name: plain\nmodel-paths: [transform]\n")
+            (project / "transform").mkdir()
+            (project / "transform/orders.sql").write_text("select * from {{ ref('users') }}\n")
+            path = project / "design.dbml"
+            path.write_text("Table users {\n id int\n}\nTable orders {\n id int\n}")
+            for flags in ([], ["--project-dir", project]):
+                result = self.cli(path, *flags, cwd=directory)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"Branch comparison unavailable: No Git checkout found; use --project-dir to select "
+                              f"the model repository. Lineage built from SQL in {project}.", result.stderr)
+                self.assertIn("Lineage: 1 edge (sql 1,", result.stderr)
+                self.assertIn('"comparison_error": "No Git checkout found', path.with_name("design_diagram.html").read_text())
 
     def test_cli_external_generated_file_and_no_git_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -209,7 +315,8 @@ class SourceComparisonTests(unittest.TestCase):
             self.assertIn("Modified model source", path.with_name("generated_diagram.html").read_text())
             result = self.cli(path, cwd=directory)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("Branch highlighting unavailable", result.stderr)
+            self.assertIn("Branch comparison unavailable: No Git checkout found", result.stderr)
+            self.assertIn('"comparison_error":', path.with_name("generated_diagram.html").read_text())
             result = self.cli(path, "--project-dir", self.root, cwd=directory)
             self.assertEqual(result.returncode, 0, result.stderr)
             result = self.cli(path, "--compare", "missing")
@@ -283,6 +390,8 @@ sources:
         self.assertIn("DBML design: Changed type: id: int → bigint", changes["tables"]["users"]["details"])
         self.assertEqual(changes["tables"]["planned"]["status"], "modified")
         self.assertEqual(changes["tables"]["retired"]["status"], "removed")
+        self.assertEqual(changes["mode"], "hybrid")
+        self.assertEqual(changes["tables"]["retired"]["baseline"]["columns"], [{"name": "id", "type": "int", "pk": False}])
 
     def test_unchanged_design_only_model_is_not_inferred_new_with_baseline(self):
         self.write("before.dbml", "Table planned {\n id int\n}")

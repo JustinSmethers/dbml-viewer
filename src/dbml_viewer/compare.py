@@ -2,7 +2,9 @@
 
 import subprocess
 from pathlib import Path
+from typing import Callable
 
+from dbml_viewer import charter
 from dbml_viewer.parser import parse_dbml_text
 
 
@@ -18,10 +20,14 @@ def _git(cwd: Path, *args: str, strip: bool = True) -> str:
     return result.stdout.strip() if strip else result.stdout
 
 
-def comparison_revision(root: Path, revision: str | None = None) -> str:
+def comparison_revision(root: Path, revision: str | None = None, *,
+                        progress: Callable[[str], None] | None = None) -> str:
     """Use a freshly fetched origin/main instead of a potentially stale local main."""
+    report = progress or (lambda message: None)
+    report(f"Checking Git comparison baseline ({revision or 'main'})")
     if revision in (None, "main", "origin/main") and "origin" in _git(root, "remote").splitlines():
         try:
+            report("Fetching origin/main (network; 30s timeout)")
             _git(root, "fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
         except ValueError as exc:
             raise ValueError(f"Could not refresh origin/main; refusing to use a stale main baseline: {exc}") from exc
@@ -37,23 +43,29 @@ def comparison_revision(root: Path, revision: str | None = None) -> str:
     raise ValueError("Neither main nor origin/main exists locally; use --compare REF or configure origin")
 
 
-def compare_branch(path: Path, current: dict, revision: str) -> dict:
+def compare_branch(path: Path, current: dict, revision: str, *,
+                   progress: Callable[[str], None] | None = None) -> dict:
     """Compare the on-disk input (including local edits) with merge-base HEAD/ref."""
+    report = progress or (lambda message: None)
     path = path.resolve()
     try:
+        report("Locating the DBML Git repository")
         root = Path(_git(path.parent, "rev-parse", "--show-toplevel"))
-        revision = comparison_revision(root, revision)
+        revision = comparison_revision(root, revision, progress=report)
+        report(f"Finding the common ancestor of HEAD and {revision}")
         target = _git(root, "rev-parse", "--verify", "--end-of-options", revision + "^{commit}")
         base = _git(root, "merge-base", "HEAD", target)
         relative = path.relative_to(root).as_posix()
         exists = _git(root, "ls-tree", base, "--", relative)
+        report(f"Reading and parsing baseline DBML ({base[:8]}:{relative})" if exists else "Preparing comparison (no baseline DBML found)")
         baseline = parse_dbml_text(_git(root, "show", base + ":" + relative)) if exists else {
             "tables": [], "refs": [], "enums": [], "group_colors": {},
         }
     except (OSError, ValueError) as exc:
         raise ValueError(f"Cannot compare with {revision!r}: {exc}") from exc
+    report("Comparing DBML tables, columns, and relationships")
     changes = compare_models(baseline, current)
-    changes.update({"revision": revision, "base": base[:8], "includes_local_edits": True})
+    changes.update({"revision": revision, "base": base[:8], "working_tree": True, "includes_local_edits": True})
     return changes
 
 
@@ -67,6 +79,15 @@ def _refs(data: dict) -> set:
             a, b = sorted((a, b))
         refs.add((*a, *b, kind))
     return refs
+
+
+def _baseline(table: dict) -> dict:
+    """What a removed model looked like, for review panels that have no card to show."""
+    return {
+        "columns": [{"name": c["name"], "type": c["type"], "pk": bool(c.get("pk"))} for c in table["columns"]],
+        "prose": charter.extract(table.get("note") or "")[0],
+        "group": table.get("group"),
+    }
 
 
 def compare_models(before: dict, after: dict) -> dict:
@@ -115,12 +136,18 @@ def compare_models(before: dict, after: dict) -> dict:
                 if any(c["type"] == enum for c in a["columns"] + b["columns"]):
                     details.append(f"Enum changed: {enum}")
         entries[name] = {"status": status, "details": details}
+        if status == "removed":
+            entries[name]["baseline"] = _baseline(old[name])
 
     old_refs, new_refs = _refs(before), _refs(after)
     for refs, verb in ((new_refs - old_refs, "Added"), (old_refs - new_refs, "Removed")):
         for a, ac, b, bc, kind in sorted(refs):
             detail = f"{verb} relationship: {a}.{ac} {kind} {b}.{bc}"
-            for name in {a, b}:
+            # A relationship to a new or removed model belongs to that model only:
+            # an existing model is not edited because a new fact points an FK at it.
+            ends = [name for name in dict.fromkeys((a, b)) if name in entries]
+            added_or_removed = [name for name in ends if entries[name]["status"] in ("new", "removed")]
+            for name in added_or_removed or ends:
                 entries[name]["details"].append(detail)
     for entry in entries.values():
         if entry["status"] == "unchanged" and entry["details"]:

@@ -4,6 +4,8 @@ from pathlib import Path
 
 from pydbml import PyDBML
 
+from dbml_viewer import charter as charter_module
+
 
 def _normalize_ref_pairs(ref):
     """Yield normalized column pairs for a DBML ref.
@@ -30,12 +32,17 @@ def parse_dbml(path: Path) -> dict:
     Returns:
         {
             "project": { "name", "note", "database_type" },
-            "tables": [{ "name", "note", "group", "columns": [...] }],
+            "tables": [{ "name", "note", "prose", "charter", "charter_error",
+                         "group", "indexes", "columns": [...] }],
             "refs": [{ "from_table", "from_column", "to_table", "to_column", "type" }],
             "groups": { "group_name": ["table1", ...] },
             "group_colors": { "group_name": "#RRGGBB" },  # only groups with [color: ...]
             "enums": [{ "name", "values": [...] }]
         }
+
+    `note` is the raw table note (diffed by compare.py). `prose` is the note
+    without its charter YAML block, `charter` the parsed block (or None), and
+    `charter_error` a parse error message (or None). See charter.extract.
     """
     return _normalize(PyDBML.parse_file(str(path)))
 
@@ -100,9 +107,14 @@ def _normalize(db) -> dict:
                 "default_kind": type(col.default).__name__ if col.default is not None else None,
                 "note": str(col.note) if col.note else "",
             })
+        note = str(table.note) if table.note else ""
+        prose, charter, charter_error = charter_module.extract(note)
         tables.append({
             "name": _table_name(table),
-            "note": str(table.note) if table.note else "",
+            "note": note,
+            "prose": prose,
+            "charter": charter,
+            "charter_error": charter_error,
             "group": table_group_map.get(_table_name(table), "_default"),
             "indexes": sorted(index.dbml for index in table.indexes),
             "columns": columns,

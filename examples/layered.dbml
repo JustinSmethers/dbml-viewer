@@ -7,10 +7,24 @@ Table source_customers {
   customer_id int [pk]
   email varchar
   created_at timestamp
+  Note: '''
+  Customer records loaded from the CRM by Fivetran. Loader-managed; not modelled here.
+  '''
 }
 Table seed_order_status {
   status_code varchar [pk]
   status_name varchar
+  Note: '''
+  Lookup of order status codes maintained by Finance Ops.
+  ---
+  purpose: Translate order status codes into reporting labels.
+  owner: finance-ops
+  consumers:
+    - prepared_orders
+  validation:
+    tests: [unique status_code, not_null status_name]
+  ---
+  '''
 }
 Table prepared_orders {
   order_id int [pk]
@@ -18,12 +32,38 @@ Table prepared_orders {
   status_code varchar
   order_date date
   amount decimal
+  Note: '''
+  One row per order from the commerce platform, with typed amounts and status codes.
+  ---
+  grain: order_id
+  purpose: Clean, typed orders for every downstream order model.
+  owner: analytics-eng
+  depends_on: [source_customers, seed_order_status]
+  history: current
+  materialization: view
+  freshness: hourly
+  validation:
+    tests: [unique order_id, not_null order_id, accepted_values status_code]
+  ---
+  '''
 }
 Table stg_order_items {
   item_id int [pk]
   order_id int
   product_id int
   quantity int
+  Note: '''
+  One row per order line.
+  ---
+  grain: [item_id]
+  purpose: Typed order lines with product and quantity.
+  owner: analytics-eng
+  materialization:
+    type: view
+  validation:
+    tests: [unique item_id, not_null order_id]
+  ---
+  '''
 }
 Table raw_products {
   product_id int [pk]
@@ -35,37 +75,154 @@ Table int_customer_orders {
   order_id int
   order_date date
   amount decimal
+  Note: '''
+  Orders joined to the customers who placed them.
+  ---
+  grain: [order_id]
+  purpose: Attach customer attributes to each order before rolling up to customers.
+  owner: analytics-eng
+  depends_on: [prepared_orders, source_customers]
+  materialization:
+    type: table
+  ---
+  '''
 }
 Table inter_order_lines {
   item_id int [pk]
   order_id int
   product_id int
   net_amount decimal
+  Note: '''
+  Order lines with discounts applied, priced in USD.
+  ---
+  grain: [order_id, line_number]
+  purpose: Net amount per order line, the base for every revenue model.
+  owner: analytics-eng
+  depends_on: [stg_order_items, prepared_orders]
+  materialization:
+    type: incremental
+    strategy: merge
+    unique_key: [order_id, line_number]
+  ---
+  '''
 }
 Table intermediate_products {
   product_id int [pk]
   product_name varchar
   category varchar
+  Note: '''
+  Products with the current merchandising category.
+  ---
+  grain: [product_id]
+  purpose: Conformed product attributes for product marts.
+  onwer: merchandising-analytics
+  depends_on: [raw_products]
+  ---
+  '''
 }
 Table marts_customers {
-  customer_id int [pk]
+  customer_id int [pk, note: 'CRM customer identifier.']
   lifetime_value decimal
-  order_count int
+  order_count int [note: 'Completed orders to date.']
+  Note: '''
+  Customer dimension with lifetime order metrics.
+  ---
+  grain: [customer_id]
+  purpose: Single customer record for CRM segmentation and LTV reporting.
+  questions:
+    - What is lifetime value by acquisition cohort?
+    - How many customers have placed more than one order?
+  consumers:
+    - Customer health dashboard (Looker)
+    - Lifecycle marketing audience sync
+  owner: analytics-eng
+  replaces: []
+  depends_on: [int_customer_orders]
+  metrics:
+    - name: lifetime_value
+      expression: sum(amount)
+      description: Total net order amount since first order.
+    - name: net_revenue
+      expression: sum(amount)
+  history: current
+  materialization:
+    type: table
+  freshness: daily by 06:00 ET
+  pii: [email]
+  validation:
+    reconciles_to: CRM customer export
+    evidence: https://example.com/validation/marts_customers
+    tests: [unique customer_id, not_null customer_id]
+  ---
+  '''
 }
 Table marts_products {
   product_id int [pk]
   product_name varchar
   category varchar
+  Note: '''
+  Product dimension with category history.
+  ---
+  grain: [product_id]
+  purpose: Track category changes so product revenue can be restated by category.
+  owner: merchandising-analytics
+  depends_on: [intermediate_products]
+  history: scd2
+  ---
+  '''
 }
 Table bridge_customer_products {
   customer_id int
   product_id int
   first_purchased_at date
+  Note: '''
+  Which customers have bought which products, and when they first did.
+  ---
+  grain: [customer_id, product_id]
+  purpose: Resolve the many-to-many between customers and products for affinity analysis.
+  consumers:
+    - Product affinity notebook
+  owner: analytics-eng
+  replaces: []
+  depends_on: [marts_customers, marts_products, inter_order_lines]
+  materialization:
+    type: incremental
+    unique_key: [customer_id, product_id]
+  ---
+  '''
 }
 Table reports_revenue {
-  order_id int
-  customer_id int
-  net_revenue decimal
+  order_id int [note: 'Order identifier from the commerce platform.']
+  customer_id int [note: 'Customer who placed the order.']
+  net_revenue decimal [note: 'Order total after discounts and refunds, in USD.']
+  Note: '''
+  Net revenue per order for finance reporting.
+  ---
+  grain: [order_id]
+  purpose: Order-level net revenue that ties to the general ledger.
+  questions:
+    - What was net revenue last month by customer?
+  consumers:
+    - Finance month-end close
+    - Exec revenue dashboard (Looker)
+  owner: finance-analytics
+  replaces: [rpt_daily_revenue]
+  depends_on: [inter_order_lines, source_customers]
+  metrics:
+    - name: net_revenue
+      expression: sum(net_revenue)
+  history: current
+  materialization:
+    type: incremental
+    unique_key: [order_id, customer_id]
+  freshness: daily by 06:00 ET
+  pii: []
+  validation:
+    reconciles_to: rpt_daily_revenue
+    evidence: https://example.com/validation/reports_revenue
+    tests: [unique order_id, not_null customer_id]
+  ---
+  '''
 }
 
 TableGroup prep_layer {

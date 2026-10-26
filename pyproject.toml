@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbml-viewer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Generate interactive HTML ER diagrams from DBML files"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -49,4 +49,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-dbml_viewer = ["templates/*.j2", "templates/*.js"]
+dbml_viewer = ["templates/*.j2", "templates/*.js", "templates/*.css"]

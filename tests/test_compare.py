@@ -45,7 +45,35 @@ class ComparisonTests(unittest.TestCase):
             'Table users {\n id int\n}',
         )
         self.assertEqual(changes["tables"]["posts"]["status"], "removed")
-        self.assertEqual(changes["tables"]["users"]["status"], "modified")
+        # The relationship went away with posts; users itself was not edited.
+        self.assertEqual(changes["tables"]["users"]["status"], "unchanged")
+        self.assertIn("Removed relationship: posts.user_id > users.id", changes["tables"]["posts"]["details"])
+
+    def test_relationship_to_new_model_is_a_detail_on_the_new_model_only(self):
+        before = 'Table dim_customers {\n customer_id int [pk]\n}\nTable fct_orders {\n customer_id int\n}'
+        after = before + '\nTable fct_churn {\n customer_id int\n}\nRef: fct_churn.customer_id > dim_customers.customer_id'
+        changes = self.compare(before, after)
+        self.assertEqual(changes["tables"]["dim_customers"], {"status": "unchanged", "details": []})
+        self.assertEqual(changes["tables"]["fct_churn"]["status"], "new")
+        self.assertIn("Added relationship: fct_churn.customer_id > dim_customers.customer_id",
+                      changes["tables"]["fct_churn"]["details"])
+        self.assertEqual(changes["counts"], {"new": 1, "modified": 0, "removed": 0, "unchanged": 2})
+        # Between two existing models, both endpoints are still modified.
+        changes = self.compare(before, before + '\nRef: fct_orders.customer_id > dim_customers.customer_id')
+        self.assertEqual(changes["counts"]["modified"], 2)
+
+    def test_removed_model_keeps_its_baseline_design(self):
+        changes = self.compare(
+            "TableGroup reports {\n rpt_old\n}\n"
+            "Table rpt_old {\n id int [pk]\n total decimal\n Note: '''Legacy rollup.\n---\ngrain: [id]\n---'''\n}",
+            "Table users {\n id int\n}",
+        )
+        self.assertEqual(changes["tables"]["rpt_old"]["baseline"], {
+            "columns": [{"name": "id", "type": "int", "pk": True}, {"name": "total", "type": "decimal", "pk": False}],
+            "prose": "Legacy rollup.",
+            "group": "reports",
+        })
+        self.assertNotIn("baseline", changes["tables"]["users"])
 
     def test_constraints_defaults_notes_and_indexes_are_compared(self):
         changes = self.compare(
@@ -125,6 +153,8 @@ class GitComparisonTests(unittest.TestCase):
         changes = compare_branch(self.path, parse_dbml_text(self.path.read_text()), 'main')
         self.assertEqual(changes['base'], base[:8])
         self.assertEqual(changes['tables']['users']['details'], ['Changed type: id: int → decimal'])
+        # The working tree is compared whether or not it has local edits.
+        self.assertTrue(changes['working_tree'])
 
     def test_new_file_is_all_new(self):
         path = self.root / 'new schema.dbml'

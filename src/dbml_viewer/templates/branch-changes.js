@@ -3,18 +3,17 @@ const comparison = MODEL.comparison || null;
 const changedNames = new Set(Object.entries(comparison?.tables || {})
   .filter(([name, change]) => tableByName[name] && ['new', 'modified'].includes(change.status))
   .map(([name]) => name));
-const reviewNames = Object.keys(comparison?.tables || {}).filter(name => comparison.tables[name].status !== 'unchanged');
 const changeContext = new Set(changedNames);
 MODEL.refs.forEach(ref => {
   if (changedNames.has(ref.from_table) || changedNames.has(ref.to_table)) {
     changeContext.add(ref.from_table); changeContext.add(ref.to_table);
   }
 });
-let branchEnabled = !!comparison, branchFocused = false, reviewIndex = -1;
+// reviewFocus is the model open in the review panel (review-panel.js sets it).
+let branchEnabled = !!comparison, branchFocused = false, reviewFocus = null;
 
 function activeReviewName() {
-  const name = reviewNames[reviewIndex];
-  return tableByName[name] ? name : null;
+  return tableByName[reviewFocus] ? reviewFocus : null;
 }
 
 function branchContext() {
@@ -35,7 +34,7 @@ function applyBranchOverlay() {
   Object.entries(nodeElements).forEach(([name, el]) => {
     el.classList.toggle('branch-muted', changedNames.size > 0 && !changedNames.has(name) && !context);
     el.classList.toggle('branch-outside', !!context && !context.has(name));
-    el.classList.toggle('change-selected', reviewIndex >= 0 && reviewNames[reviewIndex] === name);
+    el.classList.toggle('change-selected', focusName === name);
   });
   edgesSvg.querySelectorAll('.edge').forEach(edge => {
     const path = edge.querySelector('.edge-path');
@@ -52,54 +51,53 @@ function applyBranchOverlay() {
   document.getElementById('branch-focus')?.setAttribute('aria-pressed', String(branchFocused));
 }
 
+// Closes the model review panel and clears the diagram focus.
 function closeChanges() {
   const panel = document.getElementById('change-detail');
   if (panel) panel.hidden = true;
-  reviewIndex = -1;
+  reviewFocus = null;
   applyBranchOverlay();
 }
 
-function reviewChange(name) {
-  reviewIndex = reviewNames.indexOf(name);
-  if (reviewIndex < 0) return;
+// True when the card is entirely inside the part of the diagram not covered
+// by the project header, the review panel (as a sidebar) or the controls.
+function cardVisible(name) {
+  const el = nodeElements[name];
+  if (!el) return false;
+  const card = el.getBoundingClientRect(), view = container.getBoundingClientRect();
+  const panel = document.getElementById('change-detail');
+  let left = view.left;
+  if (panel && !panel.hidden && window.innerWidth > NARROW_WIDTH) {
+    left = Math.max(left, panel.getBoundingClientRect().right, document.querySelector('.project-header').getBoundingClientRect().right);
+  }
+  const right = view.right - document.querySelector('.controls').getBoundingClientRect().width - 24;
+  return card.left >= left && card.right <= right && card.top >= view.top && card.bottom <= view.bottom;
+}
+
+// Emphasize one model and its immediate neighbours in the diagram. The
+// user's zoom stays unless the card is out of view; then fit to the model
+// and its neighbours, no larger than actual size.
+function focusModel(name) {
+  reviewFocus = name;
+  if (!tableByName[name]) { applyBranchOverlay(); return; }
   selectJoin(null);
   branchEnabled = true;
-  const change = comparison.tables[name];
-  document.getElementById('change-name').textContent = name;
-  const status = document.getElementById('change-status');
-  status.textContent = {new: '+ New model', modified: '~ Modified model', removed: '− Removed model'}[change.status];
-  status.className = 'status-' + change.status;
-  const list = document.getElementById('change-list');
-  list.replaceChildren(...change.details.map(detail => {
-    const li = document.createElement('li'); li.textContent = detail; return li;
-  }));
-  document.getElementById('change-index').textContent = `${reviewIndex + 1} of ${reviewNames.length}`;
-  document.getElementById('change-detail').hidden = false;
   applyBranchOverlay();
-  if (tableByName[name]) {
-    fitToScreen(branchContext());
-  }
+  if (!cardVisible(name)) fitToScreen(branchContext(), 1);
 }
 
-if (comparison) {
-  document.getElementById('branch-toggle').addEventListener('click', () => {
-    branchEnabled = !branchEnabled;
-    if (!branchEnabled) { branchFocused = false; closeChanges(); }
-    applyBranchOverlay();
-  });
-  document.getElementById('branch-focus').disabled = !changedNames.size;
-  document.getElementById('branch-review').disabled = !reviewNames.length;
-  document.getElementById('branch-focus').addEventListener('click', () => {
+// The toolbar buttons exist only while something is under review.
+document.getElementById('branch-toggle')?.addEventListener('click', () => {
+  branchEnabled = !branchEnabled;
+  if (!branchEnabled) { branchFocused = false; closeChanges(); }
+  applyBranchOverlay();
+});
+const focusButton = document.getElementById('branch-focus');
+if (focusButton) {
+  focusButton.disabled = !changedNames.size;
+  focusButton.addEventListener('click', () => {
     selectJoin(null); closeChanges();
     branchEnabled = true; branchFocused = !branchFocused;
     applyBranchOverlay(); fitToScreen(branchFocused ? changeContext : null);
-  });
-  document.getElementById('branch-review').addEventListener('click', () => reviewChange(reviewNames[0]));
-  document.getElementById('close-changes').addEventListener('click', closeChanges);
-  document.getElementById('change-prev').addEventListener('click', () => reviewChange(reviewNames[(reviewIndex - 1 + reviewNames.length) % reviewNames.length]));
-  document.getElementById('change-next').addEventListener('click', () => reviewChange(reviewNames[(reviewIndex + 1) % reviewNames.length]));
-  canvas.addEventListener('click', event => {
-    const badge = event.target.closest('.change-badge');
-    if (badge) reviewChange(badge.closest('.table-node').dataset.table);
   });
 }

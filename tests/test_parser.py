@@ -180,5 +180,67 @@ class ParseDbmlTests(unittest.TestCase):
         self.assertFalse(next(col for col in users["columns"] if col["name"] == "profile_id")["fk"])
 
 
+    def test_table_without_block_keeps_note_as_prose(self):
+        data = self.parse_text(
+            """
+            Table users {
+              id int [pk]
+              Note: 'One row per user.'
+            }
+
+            Table posts {
+              id int [pk]
+            }
+            """
+        )
+        users, posts = data["tables"]
+        self.assertEqual(users["note"], "One row per user.")
+        self.assertEqual(users["prose"], users["note"])
+        self.assertEqual((users["charter"], users["charter_error"]), (None, None))
+        self.assertEqual((posts["note"], posts["prose"], posts["charter"]), ("", "", None))
+
+    def test_charter_block_is_split_from_prose(self):
+        data = self.parse_text(
+            """
+            Table fct_orders {
+              order_id int [pk]
+              Note: '''
+              Orders for finance.
+              ---
+              grain: order_id
+              metrics:
+                - name: revenue
+                  expression: sum(amount)
+              ---
+              '''
+            }
+            """
+        )
+        [table] = data["tables"]
+        self.assertIn("grain: order_id", table["note"])
+        self.assertEqual(table["prose"], "Orders for finance.")
+        self.assertEqual(table["charter"], {"grain": ["order_id"],
+                                            "metrics": [{"name": "revenue", "expression": "sum(amount)"}]})
+        self.assertIsNone(table["charter_error"])
+
+    def test_invalid_charter_is_reported_and_shown_as_prose(self):
+        data = self.parse_text(
+            """
+            Table fct_orders {
+              order_id int [pk]
+              Note: '''
+              ---
+              grain: [order_id
+              ---
+              '''
+            }
+            """
+        )
+        [table] = data["tables"]
+        self.assertEqual(table["prose"], table["note"])
+        self.assertIsNone(table["charter"])
+        self.assertIn("could not be parsed", table["charter_error"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,15 @@ test('layer names support separate processing ranks and naming variations', () =
   for (const name of ['print_jobs', 'internal_users', 'department', 'customers', 'cambridge_customers', '_default']) assert.equal(layout.stageName(name), null, name);
 });
 
+test('schema-qualified names classify the bare name before the schema', () => {
+  const cases = {
+    'analytics.stg_orders': 2, 'analytics.int_orders': 3, 'reporting.source_orders': 0,
+    'staging.dim_customers': 5, 'Analytics.StgOrders': 2,
+    'analytics.customers': 5, 'staging.customers': 2, 'warehouse.customers': null,
+  };
+  Object.entries(cases).forEach(([name, stage]) => assert.equal(layout.stageName(name), stage, name));
+});
+
 test('sources and seeds stack in separate blocks to the left of prep', () => {
   const model = {
     tables: [

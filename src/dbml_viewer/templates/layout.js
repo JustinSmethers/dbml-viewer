@@ -12,14 +12,22 @@ const DBMLLayout = (() => {
   const columns = [[0, 1], [2], [3], [5], [4]];
   const columnIndex = stage => columns.findIndex(stages => stages.includes(stage));
   const categoryNames = ['Sources', 'Seeds', 'Preparation', 'Intermediate', 'Bridges', 'Marts'];
-  function stageName(name) {
-    const tokens = String(name || '').replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase().split(/[^a-z0-9]+/);
+  function tokenStage(text) {
+    const tokens = text.split(/[^a-z0-9]+/);
     if (tokens.some(token => aliases[4].test(token))) return 4;
     for (const token of tokens) {
       const index = aliases.findIndex(pattern => pattern.test(token));
       if (index !== -1) return index;
     }
     return null;
+  }
+  // The bare name (after the last '.') wins, so analytics.stg_orders is prep;
+  // the schema only classifies names that say nothing themselves.
+  function stageName(name) {
+    const text = String(name || '').replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+    const bare = text.slice(text.lastIndexOf('.') + 1);
+    const stage = tokenStage(bare);
+    return stage !== null || bare === text ? stage : tokenStage(text);
   }
   function stages(model) {
     const result = {};
